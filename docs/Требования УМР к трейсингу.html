@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Converted from Markdown</title>
+  <style>
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
+      line-height: 1.6; 
+      max-width: 800px; 
+      margin: 0 auto; 
+      padding: 20px;
+      color: #333;
+    }
+    h1, h2, h3 { color: #333; margin-top: 1.5em; margin-bottom: 0.5em; }
+    h1 { font-size: 2em; }
+    h2 { font-size: 1.5em; }
+    h3 { font-size: 1.2em; }
+    code { 
+      background: #f4f4f4; 
+      padding: 2px 4px; 
+      border-radius: 3px; 
+      font-family: 'Courier New', monospace;
+    }
+    pre { 
+      background: #f4f4f4; 
+      padding: 15px; 
+      border-radius: 5px; 
+      overflow-x: auto;
+      font-family: 'Courier New', monospace;
+      line-height: 1.4;
+    }
+    blockquote { 
+      border-left: 4px solid #ddd; 
+      margin: 1em 0; 
+      padding-left: 20px; 
+      color: #666;
+      font-style: italic;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1em 0;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 8px 12px;
+      text-align: left;
+    }
+    th {
+      background-color: #f5f5f5;
+      font-weight: bold;
+    }
+    ul, ol {
+      margin: 1em 0;
+      padding-left: 2em;
+    }
+    li {
+      margin: 0.5em 0;
+    }
+  </style>
+</head>
+<body>
+<h1>Требования УМР по подключения SDK AEF tracing</h1>
+<h2>Требования УМР:</h2>
+<ul>
+<li>В коде решения подключен сбор трейсов через SDK AEF Tracing</li>
+<li>Начало работы решения начинается с контекстного менеджера aef_input_request (или его аналога, например, aef_agent_start или aef_kafka_produce)</li>
+<li>Финальный результат работы решения записывается в поле aef.response.body спана aef_input_request (или его аналога, например, aef_agent_start)</li>
+<li>При добавлении сообщений в контекст LLM, используются классы из langchain_core.messages: HumanMessage, AIMessage, SystemMessage, FunctionMessage (или аналог, который позволяет идентифицировать типы сообщений в контекстном окне)</li>
+<li>По session_id можно сгруппировать объекты оценки (отдельные запросы или диалоги) для наполнения тестовых датасетов, согласно верифицированному формату на первом этапе валидации</li>
+<li>Через спаны соответствующего вида логируется работа всех модулей, участвующих в формировании итогового ответа на входной запрос, в частности трейсингом обязательно должны быть покрыты модули GenAI-решения, чью работу необходимо логировать, согласно верифицированному формату тестового датасета на первом этапе валидаци</li>
+<li>Заполнены все атрибуты в сохраняемых спанах</li>
+</ul>
+<h2>На что обратить внимание в примере</h2>
+<p>Чтобы трейсинг заработал в вашем конкретном случае, нужны следующие действия:</p>
+<ul>
+<li>Инициализация необходимых обработчиков </li>
+<li>Задание идентификатора сессии <code>session_id_cvar.set(session_id)</code></li>
+<li>Оборачивание каждой операции внутри агента:</li>
+</ul>
+<pre><code class="language-python">with aef_agent_start(input=request_body) as agent_controller:
+      ...
+      agent_controller.add_output_result(output={&quot;answer&quot;: answer})
+</code></pre>
+<ul>
+<li>Установка и более полные инструкции описаны в <a href="https://stash.delta.sbrf.ru/projects/AEF_TEMPLATES/repos/aef-tracing-python/browse?at=v0.4.0">https://stash.delta.sbrf.ru/projects/AEF_TEMPLATES/repos/aef-tracing-python/browse?at=v0.4.0</a> </li>
+<li>Пример генерации тестового сета приведен в файле <code>create_testset_from_traces.py</code>; результат - в файле <code>testset_example.xlsx</code></li>
+</ul>
+<h2>Пример выполнения требований УМР</h2>
+<pre><code class="language-python">import json
+
+from aiohttp import web
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langchain_core.messages import HumanMessage, AIMessage
+from aef_tracing import AEFHandler, AEFTracerProvider, AEFBatchSpanProcessor
+from aef_tracing import aef_agent_start, aef_input_request, aef_tool_run, aef_retriever_run, aef_guardrail_run, aef_observation
+from aef_tracing.exporters import AEFConsoleSender
+from aef_tracing.exporters.json_exporter import AEFJsonSenderExporter
+from aef_tracing.span_processors import session_id_cvar
+
+# Инициализация провайдера трассировок
+provider = AEFTracerProvider()
+# Создание обработчика трассировок
+handler = AEFHandler(tracer=provider.get_tracer(__name__))
+# Экспорт в консоль
+sender = AEFConsoleSender()
+
+# Экспортер с отправкой через JSON
+exporter = AEFJsonSenderExporter(senders=[sender])
+processor = AEFBatchSpanProcessor(exporter)
+provider.add_span_processor(processor)
+
+
+# --- Функции агента ---
+
+@aef_observation
+def preprocess_message(text: str) -&gt; str:
+    &quot;&quot;&quot;Предобработка сообщения (тип спана other).&quot;&quot;&quot;
+    return text.strip().lower()
+
+
+def check_guardrail(text: str) -&gt; bool:
+    &quot;&quot;&quot;Проверка guardrail — фильтрация запрещённого контента.&quot;&quot;&quot;
+    forbidden_words = [&quot;запрещено&quot;, &quot;опасно&quot;]
+    for word in forbidden_words:
+        if word in text.lower():
+            return False
+    return True
+
+
+def vector_search(query: str) -&gt; list[dict]:
+    &quot;&quot;&quot;Имитация векторного поиска (retriever).&quot;&quot;&quot;
+    documents = [
+        {&quot;page_content&quot;: &quot;Python — язык программирования общего назначения.&quot;, &quot;metadata&quot;: {&quot;source&quot;: &quot;wiki&quot;}},
+        {&quot;page_content&quot;: &quot;LangChain — фреймворк для создания приложений на основе LLM.&quot;, &quot;metadata&quot;: {&quot;source&quot;: &quot;docs&quot;}},
+    ]
+    return [doc for doc in documents if any(w in doc[&quot;page_content&quot;].lower() for w in query.lower().split() if len(w) &gt; 3)]
+
+
+def external_tool_call(query: str) -&gt; str:
+    &quot;&quot;&quot;Имитация вызова внешнего инструмента.&quot;&quot;&quot;
+    return f&quot;Результат инструмента для запроса: {query}&quot;
+
+
+# --- Граф LangGraph ---
+
+def mock_llm(state: MessagesState):
+    &quot;&quot;&quot;Имитация вызова LLM через LangGraph (при использовании модели через langchain спан llm собирается автоматически через AEFHandler).&quot;&quot;&quot;
+    last_message = state[&quot;messages&quot;][-1].content
+    return {&quot;messages&quot;: [AIMessage(content=f&quot;Ответ агента: обработано сообщение &#39;{last_message}&#39;&quot;)]}
+
+
+graph = StateGraph(MessagesState)
+graph.add_node(&quot;mock_llm&quot;, mock_llm)
+graph.add_edge(START, &quot;mock_llm&quot;)
+graph.add_edge(&quot;mock_llm&quot;, END)
+graph = graph.compile()
+
+
+# --- HTTP-обработчик ---
+
+async def chat_handler(request):
+    user_message = request.query.get(&quot;message&quot;, &quot;Расскажи про Python&quot;)
+    request_headers = dict(request.headers)
+    request_body = {&quot;message&quot;: user_message}
+
+    session_id = request.headers.get(&quot;x-session-id&quot;)
+    session_id_cvar.set(session_id)
+
+    # Спан входящего запроса
+    with aef_input_request(
+        span_name=&quot;input_request&quot;,
+        headers=request_headers,
+        body=request_body,
+        path=&quot;/chat&quot;,
+        method=&quot;GET&quot;
+    ) as input_request_controller:
+
+        # Спан запуска агента
+        with aef_agent_start(input=request_body) as agent_controller:
+
+            # Спан предобработки (тип other через декоратор)
+            processed_message = preprocess_message(user_message)
+
+            # Спан guardrail
+            with aef_guardrail_run(input={&quot;text&quot;: processed_message}, span_name=&quot;content_filter&quot;) as guard_span:
+                is_allowed = check_guardrail(processed_message)
+                guard_span.add_output_result(output={&quot;allowed&quot;: is_allowed})
+
+            if not is_allowed:
+                agent_controller.add_output_result(output={&quot;answer&quot;: &quot;Запрос заблокирован guardrail.&quot;})
+                input_request_controller.add_response(
+                    headers={&quot;Content-Type&quot;: &quot;application/json&quot;},
+                    body={&quot;answer&quot;: &quot;Запрос заблокирован guardrail.&quot;},
+                    http_code=200,
+                )
+                return web.Response(text=&quot;Запрос заблокирован guardrail.&quot;)
+
+            # Спан retriever (векторный поиск)
+            with aef_retriever_run(input={&quot;query&quot;: processed_message}, span_name=&quot;vector_search&quot;) as retriever_span:
+                documents = vector_search(processed_message)
+                retriever_span.add_retriever_result(output=documents)
+
+            # Спан tool (вызов инструмента)
+            with aef_tool_run(input={&quot;query&quot;: processed_message}, span_name=&quot;external_tool&quot;) as tool_span:
+                tool_result = external_tool_call(processed_message)
+                tool_span.add_tool_result(output=tool_result)
+
+            # Вызов LangGraph графа — спаны chain и llm собираются автоматически через AEFHandler
+            result = graph.invoke(
+                {&quot;messages&quot;: [HumanMessage(content=user_message)]},
+                config={&quot;callbacks&quot;: [handler]}
+            )
+
+            answer = result[&quot;messages&quot;][-1].content
+            agent_controller.add_output_result(output={&quot;answer&quot;: answer})
+
+        response_body = {&quot;answer&quot;: answer}
+        input_request_controller.add_response(
+            headers={&quot;Content-Type&quot;: &quot;application/json&quot;},
+            body=response_body,
+            http_code=200,
+        )
+
+    return web.Response(text=answer)
+
+
+app = web.Application()
+app.add_routes([web.get(&#39;/chat&#39;, chat_handler)])
+
+if __name__ == &#39;__main__&#39;:
+    print(&quot;Server starting at http://localhost:8080&quot;)
+    print(&#39;Try: curl &quot;http://localhost:8080/chat?message=Hello&quot;&#39;)
+    web.run_app(app, port=8080)
+</code></pre>
+
+</body>
+</html>

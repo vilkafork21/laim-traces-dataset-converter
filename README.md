@@ -16,19 +16,28 @@ Production-нода преобразует сырые AEF spans в monitoring UM
 (conversation_id, final outgoing.in_reply_to)
 ```
 
-- `input_query` берётся только из текстовых частей
-  `input_text.message.content.message[*].value` или эквивалентного плоского
-  FIPA-envelope;
+- контрагент агента (тот, чьи turn оцениваются) определяется по данным, без
+  имён endpoint: это отправители, чьи `request` в большинстве случаев открывают
+  `conversation_id`. Для роутера CI09997438 это `agent_human`/`elchhumanagent`,
+  для нижестоящего CI09997554 — роутер `d-credit-helper`; нижестоящий агент,
+  присылающий уточняющий `request` внутри уже открытого разговора, контрагентом
+  не становится. Список и число открытых conversation — в
+  `processing_report.extraction.counterparts`;
+- вход turn — `incoming` с перформативом `request` от контрагента; выход —
+  `outgoing` с `in_reply_to` и перформативом, отличным от `request`, адресованный
+  контрагенту (на том же span или в другом trace);
+- `input_query` — текстовые части `input_text.message.content.message[*].value`;
+  если вход имеет вид `[label, текст]` (так роутер передаёт вопрос нижестоящему
+  агенту), метка отделяется в `route_label`, а вопрос — остальной текст;
 - `agent_response` — все текстовые части финального
-  `output_text.outgoing.content.message[*].value`, адресованного user endpoint;
-  виджеты и другие нетекстовые части пропускаются, текстовые соединяются через
-  пустую строку;
-- `route_label` берётся отдельно из входного события и никогда не заменяет
-  `agent_response`: если `output_text.outgoing.content.message` роутера имеет вид
-  `[label, echo вопроса]`, меткой является текстовая часть, не равная вопросу
-  (для CI09997438 это `liabilities`, `available_credits`, …); иначе —
-  `output_text.outgoing.receiver`, если он не user endpoint. Источник фиксируется
-  в `route_source_path`;
+  `output_text.outgoing.content.message[*].value`; виджеты и другие нетекстовые
+  части пропускаются, текстовые соединяются через пустую строку; `failure` без
+  текста считается отдельно (`failures_without_text`);
+- `route_label` никогда не заменяет `agent_response`: если
+  `output_text.outgoing.content.message` роутера имеет вид `[label, echo вопроса]`,
+  меткой является текстовая часть, не равная вопросу (для CI09997438 это
+  `liabilities`, `available_credits`, …); иначе — `output_text.outgoing.receiver`,
+  если он не контрагент. Источник фиксируется в `route_source_path`;
 - одинаковые реплики correlation key дедуплицируются, конфликтующие значения не
   публикуются и получают отдельный issue code.
 
@@ -37,29 +46,42 @@ Production-нода преобразует сырые AEF spans в monitoring UM
 Для non-FIPA агента публикуется только явная пара на внешнем
 `input_request`/HTTP boundary: запрос из request body и финальный ответ из
 response body или ключа `answer`. `start_agent` используется как аналог только
-когда в trace нет внешней boundary. Внутренние `chain`, LLM и tool spans не
-могут стать ответом пользователя.
+когда в trace нет внешней boundary. Для известных legacy-схем допускаются два
+ограниченных варианта: непосредственный parent-boundary с тем же запросом и
+`session_id`, либо ровно один явный terminal-ключ ответа при единственном
+варианте запроса в той же `(trace_id, session_id)`. Произвольный текст из
+внутренних `chain`, LLM и tool spans ответом пользователя не становится.
 
 Новая trace-схема требует отдельной versioned extraction strategy и тестовых
 fixtures. Unknown schema обрабатывается fail-closed.
 
 ## Выходы и семантика
 
-`monitoring_umr` и `parquet_test_dataset` содержат плоские строки:
+`monitoring_umr` и `parquet_test_dataset` содержат только поля UMR по
+«Формату тестового датасета» (laim-umr.v2). Для `qa` и
+`turn_with_history` это плоские строки:
 
+- `session_id` — сессия пользователя;
 - `query_id` — стабильный turn ID, для FIPA это
   `conversation_id|user_request_id`;
 - `input_query` — транспортный текст пользователя без FIPA-envelope;
-- `output_answer` и `agent_response` — финальный ответ пользователю;
-- `route_label` — отдельное решение маршрутизации;
-- trace/span IDs и source paths — provenance без сырых payload и метаданных
-  пользователя;
-- `reference_group_id` и `turn_index` определяются `assessment_mode`.
+- `output_answer` — финальный ответ пользователю;
+- `scenario` — наблюдаемая метка маршрутизации/класса (пусто, если агент её
+  не сообщает);
+- `input_query_count` = 1, `reference_group_id` и `turn_index` — по
+  `assessment_mode`;
+- для accuracy — объявленная в `monitoring_metric` prediction-колонка,
+  заполненная из `scenario`.
 
-Для `assessment_mode=dialogue` Excel-выход упаковывается по требованию УМР: одна
-строка на `session_id`, колонка `dialogue` содержит упорядоченные тройки
-`(query_id, input_query, output_answer)`. DataFrame и parquet остаются плоскими —
-это канонический внутренний транспорт мониторинга.
+Диагностика (trace/span ID, source paths, cross-trace, латентность, схема)
+в UMR не публикуется: она агрегируется в `processing_report`, а примеры
+проблем — в `processing_report.issues` без текстов и payload.
+
+Для `assessment_mode=dialogue` все три выхода — DataFrame, parquet и Excel —
+упаковываются одинаково: одна строка на `session_id`, колонка `dialogue`
+содержит упорядоченные тройки `(query_id, input_query, output_answer)`.
+`input_query_count` в диалоговом варианте не публикуется. Опциональный
+`selection.solution_version` становится первым полем обоих вариантов.
 
 Для accuracy наблюдаемый `route_label` может заполнить объявленную prediction
 колонку. Target (`GT`) из трейсов не синтезируется: он остаётся в эталонной
@@ -72,27 +94,34 @@ fixtures. Unknown schema обрабатывается fail-closed.
 `processing_report` содержит:
 
 - число protocol turn keys и полных опубликованных turn;
+- контрагентов и число открытых ими conversation;
 - `entry_without_exit` и `exit_without_entry`;
+- trace без граничного span (`no_boundary_span`) отдельно от trace с
+  неподдерживаемой схемой (`unsupported_trace_schema`);
 - эквивалентные и конфликтующие дубликаты;
 - cross-trace и полные downstream correlation chains;
 - unsupported trace schemas и неполные AEF boundaries;
 - агрегированные issue codes и ограниченные примеры без текстов/payload;
 - отдельный результат canonicalization и отсутствующие scoring sources.
 
-Неполное покрытие имеет статус `partial`; семантически корректная выборка при
-этом сохраняется. Ноль полных turn завершает вызов диагностической ошибкой.
+При неполном покрытии публикуются только доказанные complete turn, а
+`processing_report.status` становится `partial` с conservation и issue codes.
+Пустая выгрузка без полного turn по-прежнему завершает вызов ошибкой.
 
-Проверка `traces_validation_result` включена по умолчанию. Отсутствующий или
-невалидный результат останавливает ноду до чтения данных. Обход допускается
-только явной настройкой `ignore_traces_checks=true`, например для локального
-исследовательского запуска. Это единственная настройка ноды: контур
+Порт `traces_validation_result` обязателен и принимает полный verdict
+`laim-ars-env-validation`: критическая схема, итог quality и критерии K1–K6
+являются gate; readiness K7 и структурная диагностика K8 сохраняются в отчёте,
+но не подменяют проверку качества строк. Обход допускается только явной
+настройкой `ignore_traces_checks=true` для локального исследования. Это
+единственная настройка ноды: контур
 автоматический, `agent_ci` и `distributive` приходят портом `selection`,
 лимит примеров в отчёте (100) и список методов КМ зафиксированы в коде и
 совпадают с MeasurementPlan `laim-baskets-adapter` (`identity`, `accuracy`,
 `mean_criteria`, `all_criteria`, `majority`, `all_assessors`).
 
-Excel-выход очищается от управляющих символов (Excel их не принимает);
-`monitoring_umr` и parquet содержат текст без изменений.
+Excel-выход очищается от управляющих символов и не исполняет строки, начинающиеся
+с `=`, как формулы. Ячейка длиннее лимита Excel 32 767 символов отклоняет экспорт
+вместо молчаливого обрезания; `monitoring_umr` и parquet текст не меняют.
 
 ## Runtime
 
@@ -103,9 +132,6 @@ Deploy-состав задаётся `descriptor.json` и включает то�
 - `trace_dialogue.py` — versioned extraction core;
 - `canonical.py` — UMR projection и readiness gate.
 
-Старые `trace_resolver.py`, `converter.py`, `src/` и `data_utils/` сохранены в
-снимке только как lineage/reference и не входят в deploy `sourceFiles`.
-
 Production ZIP содержит только `descriptor.json`, `requirements.txt`, README и
 четыре файла из `sourceFiles`; тестовые данные, legacy-код и кеши в сборку не
 попадают.
@@ -115,13 +141,6 @@ Production ZIP содержит только `descriptor.json`, `requirements.tx
 ```bash
 python -m pytest -q monitoring/laim-traces-dataset-converter/tests
 ruff check monitoring/laim-traces-dataset-converter/main.py \
-  monitoring/laim-traces-dataset-converter/table_io.py \
-  monitoring/laim-traces-dataset-converter/trace_dialogue.py \
-  monitoring/laim-traces-dataset-converter/canonical.py \
-  monitoring/laim-traces-dataset-converter/tests
-python -m mypy --config-file \
-  monitoring/laim-traces-dataset-converter/mypy.ini \
-  monitoring/laim-traces-dataset-converter/main.py \
   monitoring/laim-traces-dataset-converter/table_io.py \
   monitoring/laim-traces-dataset-converter/trace_dialogue.py \
   monitoring/laim-traces-dataset-converter/canonical.py \
