@@ -120,8 +120,7 @@ fixtures. Unknown schema обрабатывается fail-closed.
 `mean_criteria`, `all_criteria`, `majority`, `all_assessors`).
 
 Excel-выход очищается от управляющих символов и не исполняет строки, начинающиеся
-с `=`, как формулы. Ячейка длиннее лимита Excel 32 767 символов отклоняет экспорт
-вместо молчаливого обрезания; `monitoring_umr` и parquet текст не меняют.
+с `=`, как формулы. Ячейка длиннее лимита Excel 32 767 символов обрезается в XLSX с пометкой «обрезано в XLSX», полный текст остаётся в dataframe-порте; список таких ячеек — в `processing_report.serialization.excel_truncated_cells`, плюс warning
 
 ## Runtime
 
