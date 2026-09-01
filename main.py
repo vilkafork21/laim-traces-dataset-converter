@@ -245,23 +245,35 @@ FLAT_SHEET = "Вариант для отд. запросов"
 DIALOGUE_SHEET = "Вариант для диалога"
 
 
-def _excel(frame: pd.DataFrame, assessment_mode: str) -> pd.ExcelFile:
+def _truncate_cell(value: str) -> str:
+    marker = f"…[обрезано в XLSX: {len(value)} символов]"
+    return value[: _EXCEL_CELL_LIMIT - len(marker)] + marker
+
+
+def _excel(
+    frame: pd.DataFrame, assessment_mode: str
+) -> tuple[pd.ExcelFile, list[dict[str, Any]]]:
+    """XLSX-копия UMR и список ячеек, обрезанных до лимита Excel.
+
+    Полный текст живёт в dataframe-порте; XLSX — артефакт для человека, и
+    один сверхдлинный ответ не должен ронять ноду после извлечения (LAIM-0060).
+    """
     export = frame.map(
         lambda value: (
             _EXCEL_ILLEGAL.sub(" ", value) if isinstance(value, str) else value
         )
     )
+    truncated: list[dict[str, Any]] = []
     for column in export.columns:
         too_long = export[column].map(
             lambda value: isinstance(value, str) and len(value) > _EXCEL_CELL_LIMIT
         )
-        if too_long.any():
-            row_index = too_long[too_long].index[0]
-            length = len(export.loc[row_index, column])
-            raise ValueError(
-                f"Ячейка XLSX {column}[{row_index}] имеет длину {length}: "
-                f"лимит Excel {_EXCEL_CELL_LIMIT}"
+        for row_index in too_long[too_long].index:
+            truncated.append(
+                {"column": str(column), "row": int(row_index),
+                 "length": len(export.loc[row_index, column])}
             )
+            export.loc[row_index, column] = _truncate_cell(export.loc[row_index, column])
     sheet = DIALOGUE_SHEET if assessment_mode == "dialogue" else FLAT_SHEET
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -271,7 +283,7 @@ def _excel(frame: pd.DataFrame, assessment_mode: str) -> pd.ExcelFile:
                 if isinstance(cell.value, str) and cell.value.startswith("="):
                     cell.data_type = "s"
     buffer.seek(0)
-    return pd.ExcelFile(buffer)
+    return pd.ExcelFile(buffer), truncated
 
 
 def _issue_summary(issues: pd.DataFrame) -> dict[str, Any]:
@@ -357,7 +369,7 @@ def main(
 
     stage_started = perf_counter()
     parquet_bytes = monitoring_umr.to_parquet(index=False)
-    excel_result = _excel(monitoring_umr, metric["assessment_mode"])
+    excel_result, excel_truncated = _excel(monitoring_umr, metric["assessment_mode"])
     serialization_seconds = perf_counter() - stage_started
     total_seconds = perf_counter() - started
 
@@ -373,6 +385,11 @@ def main(
     if partial_source:
         warnings.append(
             "Неполное извлечение: опубликованы только доказанные complete turn"
+        )
+    if excel_truncated:
+        warnings.append(
+            f"XLSX: {len(excel_truncated)} ячеек длиннее лимита Excel "
+            f"{_EXCEL_CELL_LIMIT} обрезаны с пометкой; полный текст — в dataframe-порте"
         )
 
     settings = {
@@ -417,6 +434,7 @@ def main(
         "issues": _issue_summary(extracted.issues),
         "semantic_profile": canonical.filter_report,
         "canonicalization": canonical.report,
+        "serialization": {"excel_truncated_cells": excel_truncated},
     }
     logger.info(
         "LAIM traces dataset converter complete: status=%s, rows=%d, seconds=%.3f",

@@ -275,15 +275,26 @@ def test_excel_export_keeps_leading_equals_as_text() -> None:
     assert cell.data_type == "s"
 
 
-def test_excel_export_rejects_cell_over_excel_limit() -> None:
+def test_excel_export_truncates_cell_over_excel_limit() -> None:
+    # Один слишком длинный ответ не должен ронять ноду после успешного
+    # извлечения (аудит LAIM-0060): dataframe-порт несёт полный текст, в
+    # XLSX ячейка обрезается с пометкой, в отчёте — warning.
     entry, exit_row = _fipa_pair(answer="x" * 32_768)
 
-    with pytest.raises(ValueError, match="лимит Excel 32767"):
-        main(
-            pd.DataFrame([entry, exit_row]),
-            _metric(),
-            traces_validation_result=_trace_quality(),
-        )
+    result = main(
+        pd.DataFrame([entry, exit_row]),
+        _metric(),
+        traces_validation_result=_trace_quality(),
+    )
+
+    assert len(result["monitoring_umr"].iloc[0]["output_answer"]) == 32_768
+    exported = pd.read_excel(result["umr_artifact"])
+    cell = exported.iloc[0]["output_answer"]
+    assert len(cell) <= 32_767 and cell.endswith("[обрезано в XLSX: 32768 символов]")
+    assert any("XLSX" in warning for warning in result["processing_report"]["warnings"])
+    assert result["processing_report"]["serialization"]["excel_truncated_cells"] == [
+        {"column": "output_answer", "row": 0, "length": 32_768}
+    ]
 
 
 def test_incomplete_extraction_publishes_complete_turns() -> None:
