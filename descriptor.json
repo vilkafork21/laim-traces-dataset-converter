@@ -1,0 +1,142 @@
+{
+  "id": "63d8fb0f-5650-42fa-97dc-30c18022fcd1",
+  "name": "LAIM traces dataset converter",
+  "description": "Protocol turns from raw spans to monitoring UMR",
+  "fullDescription": "Deterministic FIPA/AEF turn extraction with correlation-key joins, separate final response and route label, fail-closed schema handling, trace-quality diagnostics and canonical QA/dialogue UMR.",
+  "ports": [
+    {
+      "name": "monitoring_traces",
+      "label": "Monitoring traces",
+      "in": true,
+      "type": "dataframe",
+      "shape": "shape_dataframe",
+      "required": true,
+      "order": 1,
+      "description": "Сырые AEF-спаны мониторингового периода (parquet)"
+    },
+    {
+      "name": "monitoring_metric",
+      "label": "Monitoring metric",
+      "in": true,
+      "type": "default",
+      "shape": "shape_model",
+      "required": true,
+      "order": 2,
+      "description": "laim-monitoring-metric.v2; assessment_mode задаёт тот же flat/dialogue-вариант, который adapter выбрал для reference UMR"
+    },
+    {
+      "name": "traces_validation_result",
+      "label": "Trace validation result",
+      "in": true,
+      "type": "default",
+      "shape": "shape_model",
+      "required": true,
+      "order": 3
+    },
+    {
+      "name": "selection",
+      "label": "Agent selection",
+      "in": true,
+      "type": "default",
+      "shape": "shape_model",
+      "required": false,
+      "order": 4,
+      "description": "agent_ci, distributive и опциональный solution_version"
+    },
+    {
+      "name": "monitoring_umr",
+      "label": "Monitoring UMR",
+      "in": false,
+      "type": "dataframe",
+      "shape": "shape_dataframe",
+      "order": 7,
+      "description": "Flat для qa/turn_with_history либо одна packed dialogue-строка на session_id для dialogue"
+    },
+    {
+      "name": "processing_report",
+      "label": "Processing report",
+      "in": false,
+      "type": "default",
+      "shape": "shape_model",
+      "order": 8
+    },
+    {
+      "name": "parquet_test_dataset",
+      "label": "Monitoring UMR Parquet",
+      "in": false,
+      "type": "default",
+      "shape": "shape_model",
+      "order": 9
+    },
+    {
+      "name": "umr_artifact",
+      "label": "Monitoring UMR XLSX",
+      "in": false,
+      "type": "default",
+      "shape": "shape_model",
+      "order": 10,
+      "description": "Monitoring-корзина в формате тестового датасета (тот же лист, что у порта monitoring_umr)"
+    },
+    {
+      "name": "settings",
+      "label": "File saving settings",
+      "in": false,
+      "type": "default",
+      "shape": "shape_model",
+      "order": 11,
+      "description": "Параметры записи XLSX для платформенного file-writer (путь HDFS, имя файла)"
+    }
+  ],
+  "script": {
+    "type": "python",
+    "baseImageKey": "py312-simple",
+    "deployType": "docker",
+    "runConfiguration": {
+      "libraryDependencies": [
+        "requirements.txt"
+      ],
+      "sourceFiles": [
+        "main.py",
+        "table_io.py",
+        "trace_dialogue.py",
+        "canonical.py"
+      ],
+      "functionName": "main",
+      "functionParameters": [],
+      "output": {
+        "type": "json",
+        "output": []
+      }
+    }
+  },
+  "ui": {
+    "settings": [
+      {
+        "page": "Настройки",
+        "title": "LAIM traces dataset converter",
+        "components": [
+          {
+            "type": "form",
+            "label": "Validation",
+            "config": {
+              "components": [
+                {
+                  "parameter": "ignore_traces_checks",
+                  "label": "Игнорировать результаты проверки качества трейсов",
+                  "uiComponent": "checkbox",
+                  "type": "bool",
+                  "defaultValue": false
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "result": {
+      "title": "Results",
+      "components": []
+    }
+  },
+  "shape": "other"
+}
