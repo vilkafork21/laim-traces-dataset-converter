@@ -583,21 +583,31 @@ def _aef_turn(record: dict[str, object]) -> dict[str, Any] | None:
 
 def _filter_agent(
     frame: pd.DataFrame, requested_agent: str
-) -> tuple[pd.DataFrame, str]:
+) -> tuple[pd.DataFrame, str, dict[str, int]]:
+    """Строки агента и учёт отброшенных: чужой agent_id и пустой agent_id
+    не попадают в знаменатель, и отчёт обязан это показать."""
     requested = requested_agent.strip()
     agent_values = _string_series(frame["agent_id"])
-    observed = sorted(set(agent_values[agent_values.ne("")]))
+    blank = agent_values.eq("")
+    observed = sorted(set(agent_values[~blank]))
     if requested:
         selected = agent_values.str.upper().eq(requested.upper())
         if not selected.any():
             raise TraceExtractionError(f"В выгрузке нет спанов агента {requested}")
-        return frame.loc[selected], requested.upper()
-    if len(observed) != 1:
-        raise TraceExtractionError(
-            "Без agent_id выгрузка должна содержать ровно одного агента; "
-            f"найдено: {observed}"
-        )
-    return frame.loc[agent_values.ne("")], observed[0].upper()
+        agent_id = requested.upper()
+    else:
+        if len(observed) != 1:
+            raise TraceExtractionError(
+                "Без agent_id выгрузка должна содержать ровно одного агента; "
+                f"найдено: {observed}"
+            )
+        selected = ~blank
+        agent_id = observed[0].upper()
+    dropped = {
+        "dropped_foreign_agent_rows": int((~selected & ~blank).sum()),
+        "dropped_blank_agent_rows": int(blank.sum()),
+    }
+    return frame.loc[selected], agent_id, dropped
 
 
 def _parse_fipa_rows(candidates: pd.DataFrame, events: _FipaEvents) -> list[_FipaRow]:
@@ -1273,7 +1283,7 @@ def extract_turns(
             f"raw spans не содержит обязательные колонки: {missing}"
         )
 
-    frame, agent_id = _filter_agent(spans, config.agent_id)
+    frame, agent_id, dropped_rows = _filter_agent(spans, config.agent_id)
     trace_values = _string_series(frame["trace_id"])
     candidates = frame.loc[_candidate_mask(frame)]
     issues: list[dict[str, str]] = []
@@ -1405,7 +1415,8 @@ def extract_turns(
     report = {
         "contract_version": EXTRACTION_CONTRACT,
         "agent_id": agent_id,
-        "input_rows": int(len(frame)),
+        "input_rows": int(len(spans)),
+        **dropped_rows,
         "input_trace_count": int(trace_values.nunique()),
         "candidate_rows_scanned": int(len(candidates)),
         "fipa_rows": int(events.rows),

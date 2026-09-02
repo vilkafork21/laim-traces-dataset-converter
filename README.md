@@ -51,8 +51,8 @@ laim-kriteria-selector.validated_monitoring_metric ─┘
 | Порт | Обязателен | Что приходит |
 |---|---|---|
 | `monitoring_traces` | да | Таблица спанов: `DataFrame`, байты, путь к parquet/xlsx или каталог с частями (тип по сигнатуре файла `PAR1`/`PK`, не по расширению) |
-| `monitoring_metric` | да | `laim-monitoring-metric.v2` от `laim-kriteria-selector`; требуется `status = computed`, `assessment_mode` из `qa \| dialogue \| turn_with_history`, `scoring.method` из `identity \| accuracy \| mean_criteria \| all_criteria \| majority \| all_assessors`, у каждого источника `source_id`, `role`, `column_name` и полный набор ролей метода |
-| `traces_validation_result` | да (без `ignore_traces_checks`) | Полный verdict `laim-ars-env-validation`: `schema`, `quality`, `criteria` (K1–K8 с `tone`, `result`, `title`), `readiness`, `metrics` |
+| `monitoring_metric` | да | `laim-monitoring-metric.v2` от `laim-kriteria-selector`; `status` — `computed` или `not_computable`. Для `computed` требуются `assessment_mode` из `qa \| dialogue \| turn_with_history`, `scoring.method` из `identity \| accuracy \| mean_criteria \| all_criteria \| majority \| all_assessors`, у каждого источника `source_id`, `role`, `column_name` и полный набор ролей метода |
+| `traces_validation_result` | да (без `ignore_traces_checks`) | Для `computed`: полный verdict `laim-ars-env-validation` — `schema`, `quality`, `criteria` (K1–K8 с `tone`, `result`, `title`), `readiness`, `metrics`. При `not_computable` не читается |
 | `selection` | нет | `agent_ci` (фильтр по `agent_id`; без него выгрузка должна содержать ровно одного агента), `distributive` (по умолчанию `monitoring`), `solution_version` |
 
 Обязательные колонки спанов: `trace_id`, `span_id`, `aef_kind`, `span_name`,
@@ -79,12 +79,13 @@ laim-kriteria-selector.validated_monitoring_metric ─┘
 ## Как проходит прогон
 
 ```text
-1. Контракты     monitoring_metric, traces_validation_result, selection → ValueError при нарушении
-2. Чтение        read_table: DataFrame / байты / файл / каталог → спаны
-3. Извлечение    фильтр по agent_id → кандидаты-границы → пять стратегий по порядку
-4. Проекция      turn → строки UMR (flat или packed dialogue), prediction для accuracy
-5. Сериализация  parquet + XLSX (управляющие символы, ведущий «=», лимит ячейки)
-6. Отчёт         статус complete / partial / not_ready, conservation, issues
+1. Контракт КМ   not_computable → пустые UMR/parquet/XLSX, status=not_ready, без чтения трейсов
+2. Контракты     computed + traces_validation_result + selection → ValueError при нарушении
+3. Чтение        read_table: DataFrame / байты / файл / каталог → спаны
+4. Извлечение    фильтр по agent_id → кандидаты-границы → пять стратегий по порядку
+5. Проекция      turn → строки UMR (flat или packed dialogue), prediction для accuracy
+6. Сериализация  parquet + XLSX (управляющие символы, ведущий «=», лимит ячейки)
+7. Отчёт         статус complete / partial / not_ready, conservation, issues
 ```
 
 **3. Извлечение.** Кандидатами считаются спаны с `aef_kind` из
@@ -173,6 +174,11 @@ INFO main: LAIM traces dataset converter complete: status=partial, rows=1, secon
   (в прогоне CI09997554 опубликованы только `session_id` и `dialogue`);
   `input_query_count` не публикуется.
 - `selection.solution_version`, если задан, — первая колонка обоих вариантов.
+- При `monitoring_metric.status = not_computable` все три порта содержат пустой
+  фрейм соответствующего варианта, а `processing_report` — `status = not_ready`,
+  `ready_for_scoring = false` и исходные `reason_code`/`reason`. Трейсы и их
+  verdict не читаются. Если `assessment_mode` в отказе отсутствует, используется
+  пустой flat-вариант `qa`.
 
 `query_id` стабилен: FIPA — `conversation_id|reply_with`; AEF —
 `aef:<trace_id>:<span_id>`, `parent:…`, `terminal:…`, `state:…`. Target (`GT`)
@@ -188,7 +194,7 @@ prediction/target-колонок не могут совпадать с поля�
 
 | Причина | Исключение |
 |---|---|
-| `monitoring_metric` не `laim-monitoring-metric.v2`, `status != computed`, неизвестный метод, повтор `source_id`/`column_name`, неполные роли источников | `ValueError` |
+| `monitoring_metric` не `laim-monitoring-metric.v2`, `status` не `computed`/`not_computable`; для `computed` — неизвестный метод, повтор `source_id`/`column_name`, неполные роли источников | `ValueError` |
 | `traces_validation_result` отсутствует без `ignore_traces_checks`, неполный verdict, `schema["критичных нарушено"] > 0`, `quality[0].valid != true`, несогласованные `rule_violations`, любой из K1–K6 с `tone = bad` | `ValueError` |
 | `selection` не объект; `ignore_traces_checks` не bool | `ValueError` |
 | `monitoring_traces` не таблица; файл не parquet и не xlsx; в каталоге нет частей | `TypeError`, `ValueError`, `FileNotFoundError` |
@@ -199,6 +205,7 @@ prediction/target-колонок не могут совпадать с поля�
 
 | Событие | Реакция |
 |---|---|
+| `monitoring_metric.status = not_computable` | Трейсы не читаются; публикуются пустые валидные UMR/parquet/XLSX, `status = not_ready`, `ready_for_scoring = false`, исходные `reason_code`/`reason` |
 | Незамкнутые FIPA-ключи, конфликтующие реплики, `unsupported_trace_schema` | `status = partial`, WARNING, `conservation.unpublished_turns`, коды в `issues` |
 | Для `accuracy` метка маршрута есть не во всех turn (или меняется внутри сессии в `dialogue`) | prediction-колонка не публикуется, `ready_for_scoring = false`, `status = not_ready`, warning `UMR не готова к прямому scoring`; при одновременном `partial` статус — `partial` |
 | K1–K6 с `tone = warn` | `traces_validation.status = passed_with_warnings`, `warning_criteria` |
@@ -274,7 +281,9 @@ docs/                целевая архитектура, требования
   `unsupported_trace_schema` — нужна новая versioned-стратегия с fixtures.
 - **`status = not_ready`** — метод `accuracy`, а метки маршрута нет
   (`missing_scoring_sources`): агент не сообщает класс в трейсах; корзина
-  опубликована, но автоассесору нечего сравнивать с `GT`.
+  опубликована, но автоассесору нечего сравнивать с `GT`. Если в отчёте есть
+  `reason_code`, это исходный `not_computable` контракта метрики и трейсы не
+  читались.
 - **`ValueError` на `traces_validation_result`** — прочитать вердикт
   `laim-ars-env-validation`: гейт срабатывает на K1–K6, а не на K7/K8.
 - **`Без agent_id выгрузка должна содержать ровно одного агента`** — в витрине
@@ -291,7 +300,7 @@ docs/                целевая архитектура, требования
 импортов извне каталога нет.
 
 Проверки перед сборкой (CI `.github/workflows/ci.yml`, Python 3.12,
-`ruff==0.15.5`): `ruff check .` и `python -m pytest -q` (58 passed).
+`ruff==0.15.5`): `ruff check .` и `python -m pytest -q` (60 passed).
 Production ZIP собирается из головы ветки `dev` при зелёном CI: `descriptor.json`,
 `requirements.txt`, `README.md` и четыре файла из `sourceFiles`; `tests/`,
 `docs/` и кеши в сборку не попадают. Готовая версия переносится в снимок
