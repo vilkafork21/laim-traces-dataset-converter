@@ -163,9 +163,25 @@ def _validate_metric(value: object) -> dict[str, Any]:
         raise ValueError("monitoring_metric должен быть JSON object")
     if value.get("contract_version") != "laim-monitoring-metric.v2":
         raise ValueError("Ожидается laim-monitoring-metric.v2")
-    if value.get("status") != "computed":
-        raise ValueError("monitoring_metric должен иметь status=computed")
-    if value.get("assessment_mode") not in {"qa", "dialogue", "turn_with_history"}:
+    status = value.get("status")
+    if status not in {"computed", "not_computable"}:
+        raise ValueError(
+            "monitoring_metric.status должен быть computed или not_computable, "
+            f"получено {status!r}"
+        )
+    assessment_mode = value.get("assessment_mode")
+    if assessment_mode not in {None, "qa", "dialogue", "turn_with_history"}:
+        raise ValueError(
+            "monitoring_metric.assessment_mode должен быть qa, dialogue или turn_with_history"
+        )
+    if status == "not_computable":
+        for field in ("reason_code", "reason"):
+            if not _clean_text(value.get(field)):
+                raise ValueError(
+                    f"monitoring_metric not_computable требует непустое поле {field}"
+                )
+        return value
+    if assessment_mode is None:
         raise ValueError(
             "monitoring_metric.assessment_mode должен быть qa, dialogue или turn_with_history"
         )
@@ -297,6 +313,87 @@ def _issue_summary(issues: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _output_settings(agent_id: str, distributive: str) -> dict[str, object]:
+    return {
+        "fileSystemPath": (
+            "hdfs://arnsdpsbx/tmp/traces_based_datasets/"
+            f"{_artifact_scope(agent_id, distributive)}"
+        ),
+        "fileName": f"monitoring_umr_{datetime.now().strftime('%d_%m_%Y_%H_%M_%S')}.xlsx",
+        "rewrite": True,
+        "addPostfix": False,
+        "structured": False,
+    }
+
+
+def _not_computable_result(
+    metric: dict[str, Any],
+    requested_agent: str,
+    distributive: str,
+    solution_version: str,
+) -> dict[str, Any]:
+    started = perf_counter()
+    assessment_mode = metric.get("assessment_mode") or "qa"
+    columns = (
+        ["scenario", "session_id", "dialogue"]
+        if assessment_mode == "dialogue"
+        else [
+            "scenario",
+            "session_id",
+            "query_id",
+            "input_query_count",
+            "input_query",
+            "output_answer",
+        ]
+    )
+    if solution_version:
+        columns.insert(0, "solution_version")
+    monitoring_umr = pd.DataFrame(columns=columns)
+    parquet_bytes = monitoring_umr.to_parquet(index=False)
+    excel_result, excel_truncated = _excel(monitoring_umr, assessment_mode)
+    total_seconds = perf_counter() - started
+    agent_id = requested_agent or _clean_text(metric.get("basket_id"))
+    reason = metric.get("reason")
+    reason_code = metric.get("reason_code")
+    logger.warning(
+        "LAIM traces dataset converter: трейсы не читаются, КМ не вычислена "
+        "(reason_code=%s)",
+        reason_code,
+    )
+    return {
+        "monitoring_umr": monitoring_umr,
+        "processing_report": {
+            "contract_version": "laim-monitoring-trace-converter.v2",
+            "status": "not_ready",
+            "agent_id": agent_id,
+            "assessment_mode": assessment_mode,
+            "ready_for_scoring": False,
+            "reason_code": reason_code,
+            "reason": reason,
+            "warnings": [_clean_text(reason)] if _clean_text(reason) else [],
+            "traces_validation": _validate_trace_check(None, True),
+            "stage_timings_seconds": {
+                "read_input": 0.0,
+                "extract_turns": 0.0,
+                "canonicalization": 0.0,
+                "serialization": round(total_seconds, 3),
+                "total": round(total_seconds, 3),
+            },
+            "conservation": {
+                "candidate_turn_keys": 0,
+                "published_turns": 0,
+                "published_rows": 0,
+                "unpublished_turns": 0,
+                "extraction_coverage": 0.0,
+            },
+            "serialization": {"excel_truncated_cells": excel_truncated},
+        },
+        "parquet_test_dataset": parquet_bytes,
+        "umr_artifact": excel_result,
+        "settings": _output_settings(agent_id, distributive),
+    }
+
+
 def main(
     monitoring_traces: pd.DataFrame,
     monitoring_metric: dict,
@@ -308,8 +405,12 @@ def main(
     if not isinstance(ignore_traces_checks, bool):
         raise ValueError("ignore_traces_checks должен быть bool")
     metric = _validate_metric(monitoring_metric)
-    trace_check = _validate_trace_check(traces_validation_result, ignore_traces_checks)
     requested_agent, distributive, solution_version = _selection(selection)
+    if metric["status"] == "not_computable":
+        return _not_computable_result(
+            metric, requested_agent, distributive, solution_version
+        )
+    trace_check = _validate_trace_check(traces_validation_result, ignore_traces_checks)
 
     started = perf_counter()
     stage_started = perf_counter()
@@ -392,16 +493,7 @@ def main(
             f"{_EXCEL_CELL_LIMIT} обрезаны с пометкой; полный текст — в dataframe-порте"
         )
 
-    settings = {
-        "fileSystemPath": (
-            "hdfs://arnsdpsbx/tmp/traces_based_datasets/"
-            f"{_artifact_scope(agent_id, distributive)}"
-        ),
-        "fileName": f"monitoring_umr_{datetime.now().strftime('%d_%m_%Y_%H_%M_%S')}.xlsx",
-        "rewrite": True,
-        "addPostfix": False,
-        "structured": False,
-    }
+    settings = _output_settings(agent_id, distributive)
     processing_report = {
         "contract_version": "laim-monitoring-trace-converter.v2",
         "status": status,

@@ -450,3 +450,73 @@ def test_foreign_and_blank_agent_rows_are_counted() -> None:
     assert extraction["input_rows"] == 4
     assert extraction["dropped_foreign_agent_rows"] == 1
     assert extraction["dropped_blank_agent_rows"] == 1
+
+
+def test_not_computable_skips_traces_and_publishes_empty_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_on_trace_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Трейсы не должны читаться при not_computable")
+
+    monkeypatch.setattr(converter, "read_table", fail_on_trace_read)
+    metric = {
+        "contract_version": "laim-monitoring-metric.v2",
+        "status": "not_computable",
+        "reason_code": "official_baseline_missing",
+        "reason": "Validation report не содержит официальный baseline",
+    }
+
+    result = main(object(), metric)
+
+    frame = result["monitoring_umr"]
+    assert frame.empty
+    assert list(frame.columns) == [
+        "scenario",
+        "session_id",
+        "query_id",
+        "input_query_count",
+        "input_query",
+        "output_answer",
+    ]
+    parquet = pd.read_parquet(BytesIO(result["parquet_test_dataset"]))
+    assert parquet.empty and list(parquet.columns) == list(frame.columns)
+    excel = pd.read_excel(result["umr_artifact"])
+    assert excel.empty and list(excel.columns) == list(frame.columns)
+    report = result["processing_report"]
+    assert report["contract_version"] == "laim-monitoring-trace-converter.v2"
+    assert report["status"] == "not_ready"
+    assert report["assessment_mode"] == "qa"
+    assert report["ready_for_scoring"] is False
+    assert report["reason_code"] == "official_baseline_missing"
+    assert report["reason"] == metric["reason"]
+    assert result["settings"]["fileSystemPath"].startswith(
+        "hdfs://arnsdpsbx/tmp/traces_based_datasets/"
+    )
+
+
+
+
+def test_monitoring_metric_rejects_unknown_status() -> None:
+    metric = _metric()
+    metric["status"] = "pending"
+
+    with pytest.raises(ValueError, match="computed или not_computable"):
+        main(object(), metric)
+
+
+
+
+@pytest.mark.parametrize("missing_field", ["reason_code", "reason"])
+def test_not_computable_requires_reason_fields(missing_field: str) -> None:
+    metric = {
+        "contract_version": "laim-monitoring-metric.v2",
+        "status": "not_computable",
+        "reason_code": "official_baseline_missing",
+        "reason": "Официальный baseline отсутствует",
+    }
+    metric.pop(missing_field)
+
+    with pytest.raises(ValueError, match=missing_field):
+        main(object(), metric)
+
+
