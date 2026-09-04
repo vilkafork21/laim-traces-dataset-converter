@@ -200,8 +200,11 @@ def test_every_trace_quality_item_must_be_valid() -> None:
     quality = _trace_quality()
     quality["quality"][0]["valid"] = False
 
-    with pytest.raises(ValueError, match="не прошли проверку качества"):
-        main(pd.DataFrame(), _metric(), traces_validation_result=quality)
+    report = main(pd.DataFrame(), _metric(), traces_validation_result=quality)["processing_report"]
+
+    assert report["status"] == "not_ready" and report["reason_code"] == "dq_failed"
+    assert report["traces_validation"]["status"] == "failed"
+    assert "quality" in report["traces_validation"]["failed_criteria"][0]
 
 
 def test_legacy_quality_only_validation_result_is_rejected() -> None:
@@ -213,12 +216,101 @@ def test_legacy_quality_only_validation_result_is_rejected() -> None:
         )
 
 
-def test_bad_k1_k6_validation_criterion_is_rejected() -> None:
+def test_failed_dq_publishes_not_ready_without_reading_traces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Красный DQ — вердикт 6.3.2, а не падение: трейсы не читаются, зависимые
+    тесты получают not_ready с причиной."""
+
+    def fail_on_trace_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Трейсы не должны читаться при красном DQ")
+
+    monkeypatch.setattr(converter, "read_table", fail_on_trace_read)
     quality = _trace_quality()
     quality["criteria"]["K2"]["tone"] = "bad"
 
-    with pytest.raises(ValueError, match="K1–K6"):
-        main(pd.DataFrame(), _metric(), traces_validation_result=quality)
+    result = main(object(), _metric(), traces_validation_result=quality)
+
+    report = result["processing_report"]
+    assert result["monitoring_umr"].empty
+    assert report["status"] == "not_ready" and report["ready_for_scoring"] is False
+    assert report["reason_code"] == "dq_failed" and "K2" in report["reason"]
+    assert report["traces_validation"]["status"] == "failed"
+    assert report["traces_validation"]["failed_criteria"] == ["K2"]
+    readiness = report["data_readiness"]
+    assert readiness["state"] == "failed" and readiness["reason_code"] == "dq_failed"
+    assert readiness["published_units"] == 0 and readiness["dq_status"] == "failed"
+
+
+def test_empty_extraction_is_not_ready_with_counters() -> None:
+    orphan = _span(
+        "trace-1", "span-1", {"stage": "chain"}, {"stage": "chain"}, 10
+    )
+    orphan["aef_kind"] = "chain"
+    orphan["span_name"] = "Domain Agent Graph"
+
+    result = main(pd.DataFrame([orphan]), _metric(), traces_validation_result=_trace_quality())
+
+    report = result["processing_report"]
+    assert result["monitoring_umr"].empty
+    assert report["status"] == "not_ready"
+    assert report["reason_code"] == "no_turns_extracted"
+    assert "no_boundary_trace_count=1" in report["reason"]
+    assert report["data_readiness"]["state"] == "insufficient"
+    assert report["extraction"]["no_boundary_trace_count"] == 1
+    assert report["conservation"]["published_rows"] == 0
+
+
+def test_data_readiness_states() -> None:
+    entry, exit_row = _fipa_pair()
+    sufficient = main(
+        pd.DataFrame([entry, exit_row]), _metric(), traces_validation_result=_trace_quality()
+    )["processing_report"]["data_readiness"]
+    assert sufficient["state"] == "sufficient" and sufficient["limits"] == []
+    assert sufficient["unit"] == "turn" and sufficient["published_units"] == 1
+    assert sufficient["extraction_coverage"] == 1.0 and sufficient["dq_status"] == "passed"
+
+    warned = _trace_quality()
+    warned["criteria"]["K3"]["tone"] = "warn"
+    limited = main(
+        pd.DataFrame([entry, exit_row]), _metric(), traces_validation_result=warned
+    )["processing_report"]["data_readiness"]
+    assert limited["state"] == "limited" and limited["reason_code"] == "dq_warnings"
+    assert "K3" in limited["reason"]
+
+    malformed = entry.copy()
+    malformed["trace_id"] = "trace-malformed"
+    malformed["span_id"] = "span-malformed"
+    malformed["input_text"] = json.dumps({"message": {
+        "sender": "agent_human", "receiver": "orchestrator",
+        "conversation_id": "conversation-malformed", "reply_with": "request-malformed",
+        "content": {"message": []},
+    }}, ensure_ascii=False)
+    partial = main(
+        pd.DataFrame([entry, exit_row, malformed]), _metric(),
+        traces_validation_result=_trace_quality(), min_extraction_coverage=0.9,
+    )["processing_report"]["data_readiness"]
+    assert partial["state"] == "limited"
+    assert partial["limits"] == ["partial_extraction", "low_extraction_coverage"]
+
+    bypassed = main(
+        pd.DataFrame([entry, exit_row]), _metric(), ignore_traces_checks=True
+    )["processing_report"]["data_readiness"]
+    assert bypassed["state"] == "limited" and bypassed["reason_code"] == "bypassed_dq"
+
+
+def test_min_extraction_coverage_is_validated_and_declared() -> None:
+    with pytest.raises(ValueError, match="min_extraction_coverage"):
+        main(pd.DataFrame(), _metric(), traces_validation_result=_trace_quality(),
+             min_extraction_coverage=1.5)
+    descriptor = json.loads((NODE_ROOT / "descriptor.json").read_text())
+    settings = {
+        item["parameter"]: item["defaultValue"]
+        for section in descriptor["ui"]["settings"]
+        for component in section["components"]
+        for item in component["config"]["components"]
+    }
+    assert settings["min_extraction_coverage"] == 0.9
 
 
 def test_all_assessors_metric_is_accepted() -> None:
@@ -489,6 +581,8 @@ def test_not_computable_skips_traces_and_publishes_empty_artifacts(
     assert report["ready_for_scoring"] is False
     assert report["reason_code"] == "official_baseline_missing"
     assert report["reason"] == metric["reason"]
+    assert report["data_readiness"]["state"] == "insufficient"
+    assert report["data_readiness"]["reason_code"] == "official_baseline_missing"
     assert result["settings"]["fileSystemPath"].startswith(
         "hdfs://arnsdpsbx/tmp/traces_based_datasets/"
     )

@@ -75,17 +75,18 @@ laim-kriteria-selector.validated_monitoring_metric ─┘
 | Настройка | По умолчанию | Зачем |
 |---|---|---|
 | `ignore_traces_checks` | `false` | Пропустить гейт `traces_validation_result` (в отчёте `traces_validation.status = bypassed`). Только для локального исследования; в контуре не включать |
+| `min_extraction_coverage` | `0.9` | Покрытие извлечения turn ниже порога переводит `data_readiness.state` в `limited` (`low_extraction_coverage`) |
 
 ## Как проходит прогон
 
 ```text
 1. Контракт КМ   not_computable → пустые UMR/parquet/XLSX, status=not_ready, без чтения трейсов
-2. Контракты     computed + traces_validation_result + selection → ValueError при нарушении
+2. Контракты     computed + traces_validation_result + selection → ValueError при структурном нарушении; красный DQ (K1 критичные, quality.valid=false, K1–K6 bad) → status=not_ready, reason_code=dq_failed, трейсы не читаются
 3. Чтение        read_table: DataFrame / байты / файл / каталог → спаны
 4. Извлечение    фильтр по agent_id → кандидаты-границы → пять стратегий по порядку
 5. Проекция      turn → строки UMR (flat или packed dialogue), prediction для accuracy
 6. Сериализация  parquet + XLSX (управляющие символы, ведущий «=», лимит ячейки)
-7. Отчёт         статус complete / partial / not_ready, conservation, issues
+7. Отчёт         статус complete / partial / not_ready, conservation, issues, data_readiness (6.3.2)
 ```
 
 **3. Извлечение.** Кандидатами считаются спаны с `aef_kind` из
@@ -195,10 +196,11 @@ prediction/target-колонок не могут совпадать с поля�
 | Причина | Исключение |
 |---|---|
 | `monitoring_metric` не `laim-monitoring-metric.v2`, `status` не `computed`/`not_computable`; для `computed` — неизвестный метод, повтор `source_id`/`column_name`, неполные роли источников | `ValueError` |
-| `traces_validation_result` отсутствует без `ignore_traces_checks`, неполный verdict, `schema["критичных нарушено"] > 0`, `quality[0].valid != true`, несогласованные `rule_violations`, любой из K1–K6 с `tone = bad` | `ValueError` |
+| `traces_validation_result` отсутствует без `ignore_traces_checks`, неполный verdict, нецелое `schema["критичных нарушено"]`, несогласованные `rule_violations`, некорректные `criteria`/`readiness`/`metrics` | `ValueError` |
+| `min_extraction_coverage` не число от 0 до 1 | `ValueError` |
 | `selection` не объект; `ignore_traces_checks` не bool | `ValueError` |
 | `monitoring_traces` не таблица; файл не parquet и не xlsx; в каталоге нет частей | `TypeError`, `ValueError`, `FileNotFoundError` |
-| Пустая выгрузка, нет обязательных колонок, нет спанов `agent_ci`, несколько агентов без `agent_ci`, ни одного полного turn | `TraceExtractionError` |
+| Пустая выгрузка, нет обязательных колонок, нет спанов `agent_ci`, несколько агентов без `agent_ci` | `TraceExtractionError` |
 | Turn без `session_id`/текста после извлечения, повтор `(session_id, query_id)`, prediction/target-колонка конфликтует с полем UMR, `complete_turns` не равен числу строк | `MonitoringCanonicalizationError` |
 
 Всё остальное — деградация с записью в `processing_report`:
@@ -206,6 +208,8 @@ prediction/target-колонок не могут совпадать с поля�
 | Событие | Реакция |
 |---|---|
 | `monitoring_metric.status = not_computable` | Трейсы не читаются; публикуются пустые валидные UMR/parquet/XLSX, `status = not_ready`, `ready_for_scoring = false`, исходные `reason_code`/`reason` |
+| Красный DQ: `schema["критичных нарушено"] > 0`, `quality[0].valid != true`, любой из K1–K6 с `tone = bad` | Трейсы не читаются; пустые UMR/parquet/XLSX, `status = not_ready`, `reason_code = dq_failed`, `traces_validation.status = failed` с `failed_criteria`, `data_readiness.state = failed` |
+| Ни одного полного turn по поддерживаемым схемам | пустые UMR/parquet/XLSX, `status = not_ready`, `reason_code = no_turns_extracted`, счётчики извлечения в `extraction`, `data_readiness.state = insufficient` |
 | Незамкнутые FIPA-ключи, конфликтующие реплики, `unsupported_trace_schema` | `status = partial`, WARNING, `conservation.unpublished_turns`, коды в `issues` |
 | Для `accuracy` метка маршрута есть не во всех turn (или меняется внутри сессии в `dialogue`) | prediction-колонка не публикуется, `ready_for_scoring = false`, `status = not_ready`, warning `UMR не готова к прямому scoring`; при одновременном `partial` статус — `partial` |
 | K1–K6 с `tone = warn` | `traces_validation.status = passed_with_warnings`, `warning_criteria` |
@@ -252,6 +256,12 @@ WARNING на каждую деградацию. Полная картина — 
 ```
 
 Триаж сотни прогонов — по этим JSON без чтения логов: `status`,
+`data_readiness` — готовность данных периода по карточке 6.3.2: `state`
+(`sufficient` / `limited` / `insufficient` / `failed`), `reason_code`, `reason`,
+`limits` (`partial_extraction`, `low_extraction_coverage`,
+`not_ready_for_scoring`, `dq_warnings`, `bypassed_dq`), `unit`
+(`turn` / `session`), `published_units`, `extraction_coverage`, `dq_status`,
+`min_extraction_coverage`. Читает агрегатор как базовый тест 6.3.2.
 `conservation.extraction_coverage`, `issues.counts`, `extraction.strategies`,
 `extraction.counterparts`, `canonicalization.missing_scoring_sources`,
 `serialization.excel_truncated_cells`. Примеры в `issues.examples` (не больше

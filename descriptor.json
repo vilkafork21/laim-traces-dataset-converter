@@ -58,7 +58,8 @@
       "in": false,
       "type": "default",
       "shape": "shape_model",
-      "order": 8
+      "order": 8,
+      "description": "; data_readiness — готовность данных периода по карточке 6.3.2 (sufficient / limited / insufficient / failed) для агрегатора"
     },
     {
       "name": "parquet_test_dataset",
@@ -126,6 +127,13 @@
                   "uiComponent": "checkbox",
                   "type": "bool",
                   "defaultValue": false
+                },
+                {
+                  "parameter": "min_extraction_coverage",
+                  "label": "Минимальное покрытие извлечения turn для состояния «достаточно»",
+                  "uiComponent": "input",
+                  "type": "float",
+                  "defaultValue": 0.9
                 }
               ]
             }
