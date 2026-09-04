@@ -16,7 +16,7 @@ import pandas as pd
 
 from canonical import canonicalize_turns
 from table_io import read_table
-from trace_dialogue import ExtractionConfig, TraceExtractionError, extract_turns
+from trace_dialogue import ExtractionConfig, extract_turns
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +81,9 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
             "traces_validation_result.schema не содержит целое поле "
             "'критичных нарушено'"
         )
+    failed_checks: list[str] = []
     if critical:
-        raise ValueError("Трейсы не прошли критическую проверку схемы K1")
+        failed_checks.append("K1: критичные нарушения схемы")
 
     quality = value.get("quality")
     if not isinstance(quality, list) or len(quality) != 1:
@@ -104,7 +105,7 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
             "traces_validation_result.quality содержит несогласованные нарушения"
         )
     if quality_item.get("valid") is not True:
-        raise ValueError("Трейсы некорректны и не прошли проверку качества")
+        failed_checks.append("quality: телеметрия не прошла проверку качества")
 
     criteria = value["criteria"]
     if not isinstance(criteria, dict):
@@ -121,11 +122,9 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
             or not _clean_text(criterion.get("title"))
         ):
             raise ValueError(f"traces_validation_result.criteria.{code} некорректен")
-    failed = [code for code in sorted(expected_criteria)[:6] if criteria[code]["tone"] == "bad"]
-    if failed:
-        raise ValueError(
-            "Трейсы не прошли блокирующий контур K1–K6: " + ", ".join(failed)
-        )
+    failed_checks.extend(
+        code for code in sorted(expected_criteria)[:6] if criteria[code]["tone"] == "bad"
+    )
 
     readiness = value["readiness"]
     if (
@@ -148,7 +147,7 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
     warnings = [
         code for code in sorted(expected_criteria)[:6] if criteria[code]["tone"] == "warn"
     ]
-    return {
+    verdict = {
         "source": "laim-ars-env-validation.verdict",
         "scope": "K1-K6",
         "status": "passed_with_warnings" if warnings else "passed",
@@ -156,6 +155,16 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
         "non_gating_criteria": {code: criteria[code] for code in ("K7", "K8")},
         "readiness": readiness,
     }
+    if failed_checks:
+        # Красный DQ — вердикт, а не падение ноды: данные периода непригодны,
+        # зависимые тесты получают «не оценено» с этой причиной.
+        verdict.update(
+            status="failed",
+            failed_criteria=failed_checks,
+            reason="Телеметрия не прошла блокирующие проверки качества: "
+            + "; ".join(failed_checks),
+        )
+    return verdict
 
 
 def _validate_metric(value: object) -> dict[str, Any]:
@@ -326,11 +335,66 @@ def _output_settings(agent_id: str, distributive: str) -> dict[str, object]:
     }
 
 
-def _not_computable_result(
+def _unit_name(assessment_mode: str) -> str:
+    return "session" if assessment_mode == "dialogue" else "turn"
+
+
+def _data_readiness(
+    *,
+    status: str,
+    trace_check: dict[str, Any],
+    coverage: float,
+    minimum: float,
+    units: int,
+    assessment_mode: str,
+) -> dict[str, Any]:
+    """Блок готовности данных периода (карточка 6.3.2): достаточно / ограниченно /
+    недостаточно; ограничения перечисляются кодами."""
+    limits: list[tuple[str, str]] = []
+    if status == "partial":
+        limits.append(("partial_extraction", "опубликованы только доказанные complete turn"))
+    if coverage < minimum:
+        limits.append((
+            "low_extraction_coverage",
+            f"покрытие извлечения {coverage:.2f} ниже минимума {minimum:.2f}",
+        ))
+    if status == "not_ready":
+        limits.append(("not_ready_for_scoring", "UMR не готова к прямому scoring"))
+    if trace_check["status"] == "passed_with_warnings":
+        limits.append((
+            "dq_warnings",
+            "предупреждения проверки телеметрии: " + ", ".join(trace_check["warning_criteria"]),
+        ))
+    if trace_check["status"] == "bypassed":
+        limits.append(("bypassed_dq", "проверка качества телеметрии пропущена настройкой"))
+    state = "insufficient" if units == 0 else ("limited" if limits else "sufficient")
+    return {
+        "state": state,
+        "reason_code": "no_units" if units == 0 else (limits[0][0] if limits else None),
+        "reason": (
+            "единиц мониторинга нет" if units == 0
+            else ("; ".join(text for _, text in limits) or None)
+        ),
+        "limits": [code for code, _ in limits],
+        "unit": _unit_name(assessment_mode),
+        "published_units": units,
+        "extraction_coverage": coverage,
+        "dq_status": trace_check["status"],
+        "min_extraction_coverage": minimum,
+    }
+
+
+def _not_ready_result(
     metric: dict[str, Any],
     requested_agent: str,
     distributive: str,
     solution_version: str,
+    *,
+    reason_code: str,
+    reason: str,
+    trace_check: dict[str, Any],
+    minimum: float,
+    extraction: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     assessment_mode = metric.get("assessment_mode") or "qa"
@@ -352,42 +416,57 @@ def _not_computable_result(
     parquet_bytes = monitoring_umr.to_parquet(index=False)
     excel_result, excel_truncated = _excel(monitoring_umr, assessment_mode)
     total_seconds = perf_counter() - started
-    agent_id = requested_agent or _clean_text(metric.get("basket_id"))
-    reason = metric.get("reason")
-    reason_code = metric.get("reason_code")
-    logger.warning(
-        "LAIM traces dataset converter: трейсы не читаются, КМ не вычислена "
-        "(reason_code=%s)",
-        reason_code,
+    agent_id = (
+        (extraction or {}).get("agent_id")
+        or requested_agent
+        or _clean_text(metric.get("basket_id"))
     )
+    logger.warning(
+        "LAIM traces dataset converter: UMR не опубликована (reason_code=%s): %s",
+        reason_code,
+        reason,
+    )
+    coverage = float((extraction or {}).get("extraction_coverage") or 0.0)
+    readiness = _data_readiness(
+        status="not_ready", trace_check=trace_check, coverage=coverage,
+        minimum=minimum, units=0, assessment_mode=assessment_mode,
+    )
+    readiness.update(
+        state="failed" if reason_code == "dq_failed" else "insufficient",
+        reason_code=reason_code, reason=reason,
+    )
+    report: dict[str, Any] = {
+        "contract_version": "laim-monitoring-trace-converter.v2",
+        "status": "not_ready",
+        "agent_id": agent_id,
+        "assessment_mode": assessment_mode,
+        "ready_for_scoring": False,
+        "reason_code": reason_code,
+        "reason": reason,
+        "warnings": [reason],
+        "traces_validation": trace_check,
+        "data_readiness": readiness,
+        "stage_timings_seconds": {
+            "read_input": 0.0,
+            "extract_turns": 0.0,
+            "canonicalization": 0.0,
+            "serialization": round(total_seconds, 3),
+            "total": round(total_seconds, 3),
+        },
+        "conservation": {
+            "candidate_turn_keys": int((extraction or {}).get("candidate_turn_keys") or 0),
+            "published_turns": 0,
+            "published_rows": 0,
+            "unpublished_turns": int((extraction or {}).get("candidate_turn_keys") or 0),
+            "extraction_coverage": coverage,
+        },
+        "serialization": {"excel_truncated_cells": excel_truncated},
+    }
+    if extraction is not None:
+        report["extraction"] = extraction
     return {
         "monitoring_umr": monitoring_umr,
-        "processing_report": {
-            "contract_version": "laim-monitoring-trace-converter.v2",
-            "status": "not_ready",
-            "agent_id": agent_id,
-            "assessment_mode": assessment_mode,
-            "ready_for_scoring": False,
-            "reason_code": reason_code,
-            "reason": reason,
-            "warnings": [_clean_text(reason)] if _clean_text(reason) else [],
-            "traces_validation": _validate_trace_check(None, True),
-            "stage_timings_seconds": {
-                "read_input": 0.0,
-                "extract_turns": 0.0,
-                "canonicalization": 0.0,
-                "serialization": round(total_seconds, 3),
-                "total": round(total_seconds, 3),
-            },
-            "conservation": {
-                "candidate_turn_keys": 0,
-                "published_turns": 0,
-                "published_rows": 0,
-                "unpublished_turns": 0,
-                "extraction_coverage": 0.0,
-            },
-            "serialization": {"excel_truncated_cells": excel_truncated},
-        },
+        "processing_report": report,
         "parquet_test_dataset": parquet_bytes,
         "umr_artifact": excel_result,
         "settings": _output_settings(agent_id, distributive),
@@ -400,17 +479,36 @@ def main(
     traces_validation_result: dict | None = None,
     selection: dict | None = None,
     ignore_traces_checks: bool = False,
+    min_extraction_coverage: float = 0.9,
 ) -> dict[str, Any]:
     """Извлечь протокольные turn и вернуть UMR с проверяемым отчётом."""
     if not isinstance(ignore_traces_checks, bool):
         raise ValueError("ignore_traces_checks должен быть bool")
+    if (
+        isinstance(min_extraction_coverage, bool)
+        or not isinstance(min_extraction_coverage, (int, float))
+        or not 0 <= min_extraction_coverage <= 1
+    ):
+        raise ValueError(
+            "min_extraction_coverage должен быть числом от 0 до 1, "
+            f"получено {min_extraction_coverage!r}"
+        )
+    minimum = float(min_extraction_coverage)
     metric = _validate_metric(monitoring_metric)
     requested_agent, distributive, solution_version = _selection(selection)
     if metric["status"] == "not_computable":
-        return _not_computable_result(
-            metric, requested_agent, distributive, solution_version
+        return _not_ready_result(
+            metric, requested_agent, distributive, solution_version,
+            reason_code=metric["reason_code"], reason=metric["reason"],
+            trace_check=_validate_trace_check(None, True), minimum=minimum,
         )
     trace_check = _validate_trace_check(traces_validation_result, ignore_traces_checks)
+    if trace_check["status"] == "failed":
+        return _not_ready_result(
+            metric, requested_agent, distributive, solution_version,
+            reason_code="dq_failed", reason=trace_check["reason"],
+            trace_check=trace_check, minimum=minimum,
+        )
 
     started = perf_counter()
     stage_started = perf_counter()
@@ -433,12 +531,18 @@ def main(
     extraction_seconds = perf_counter() - stage_started
     if extracted.turns.empty:
         report = extracted.report
-        raise TraceExtractionError(
-            "Не найдено полных turn по поддерживаемым схемам: "
-            f"candidate_turn_keys={report['candidate_turn_keys']}, "
-            f"entry_without_exit={report['entry_without_exit']}, "
-            f"exit_without_entry={report['exit_without_entry']}, "
-            f"unsupported_trace_count={report['unsupported_trace_count']}"
+        return _not_ready_result(
+            metric, requested_agent, distributive, solution_version,
+            reason_code="no_turns_extracted",
+            reason=(
+                "Не найдено полных turn по поддерживаемым схемам: "
+                f"candidate_turn_keys={report['candidate_turn_keys']}, "
+                f"entry_without_exit={report['entry_without_exit']}, "
+                f"exit_without_entry={report['exit_without_entry']}, "
+                f"unsupported_trace_count={report['unsupported_trace_count']}, "
+                f"no_boundary_trace_count={report['no_boundary_trace_count']}"
+            ),
+            trace_check=trace_check, minimum=minimum, extraction=report,
         )
     unresolved_turns = (
         extracted.report["candidate_turn_keys"] - extracted.report["complete_turns"]
@@ -515,6 +619,11 @@ def main(
             "serialization": round(serialization_seconds, 3),
             "total": round(total_seconds, 3),
         },
+        "data_readiness": _data_readiness(
+            status=status, trace_check=trace_check,
+            coverage=float(extracted.report["extraction_coverage"]), minimum=minimum,
+            units=int(len(monitoring_umr)), assessment_mode=metric["assessment_mode"],
+        ),
         "conservation": {
             "candidate_turn_keys": extracted.report["candidate_turn_keys"],
             "published_turns": int(extracted.report["complete_turns"]),
