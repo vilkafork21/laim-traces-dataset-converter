@@ -275,3 +275,22 @@ def test_dialogue_keeps_varying_scenarios() -> None:
     assert result.result["scenario"].tolist() == ["domain-agent", "other-agent"]
     assert result.result["query_id"].tolist() == ["t1", "t2"]
     assert result.result["turn_index"].tolist() == [1, 2]
+
+
+def test_final_score_still_requires_declared_route():
+    metric = reviewed_metric(_metric(), prediction_observable='route_label')
+    turns = _turns()
+    turns['route_label'] = ''
+    result = canonicalize_turns(turns, monitoring_metric=metric, extraction_report=_report())
+    assert result.report['ready_for_scoring'] is False
+    assert not result.result.evaluation_ready.any()
+    assert 'scenario' in result.report['missing_scoring_sources']
+
+
+def test_final_score_records_declared_route_mapping():
+    metric = reviewed_metric(_metric(), prediction_observable='route_label')
+    result = canonicalize_turns(_turns(), monitoring_metric=metric, extraction_report=_report())
+    assert result.report['prediction_mapping']['column_name'] == 'scenario'
+    assert result.report['prediction_mapping']['source'] == 'route_label'
+    assert result.result.scenario.tolist() == ['domain-agent']
+    assert result.report['ready_for_scoring'] is True

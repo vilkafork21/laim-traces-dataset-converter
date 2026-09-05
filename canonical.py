@@ -103,12 +103,14 @@ def canonicalize_turns(
     flat["evaluation_ready"] = not missing_evidence
     flat["evaluation_reason"] = ("Не поддержаны обязательные свидетельства: " + ", ".join(missing_evidence)) if missing_evidence else ""
 
-    # Для accuracy monitoring поставляет только наблюдаемое prediction. Target
-    # остаётся в эталонной корзине, где baskets-adapter вычисляет main_metric.
+    # Наблюдаемая величина нужна судье независимо от формулы человеческой КМ.
     prediction_mapping = None
     missing_scoring_sources: list[str] = []
     reference_only_sources: list[str] = []
     prediction_column = None
+    observable = monitoring_metric["evaluation"]["prediction_observable"]
+    if observable is not None:
+        prediction_column = "scenario" if observable == "route_label" else "output_answer"
     if method == "accuracy":
         columns = {source["role"]: source["column_name"].strip() for source in sources}
         prediction_column = columns["prediction"]
@@ -121,7 +123,8 @@ def canonicalize_turns(
             raise MonitoringCanonicalizationError(
                 f"target-колонка {target_column!r} конфликтует с полем UMR"
             )
-        observable = monitoring_metric["evaluation"]["prediction_observable"]
+        reference_only_sources.append(target_column)
+    if prediction_column is not None:
         observed = scenario if observable == "route_label" else answers
         if not _blank_mask(observed).any():
             flat[prediction_column] = observed
@@ -132,7 +135,6 @@ def canonicalize_turns(
             }
         else:
             missing_scoring_sources.append(prediction_column)
-        reference_only_sources.append(target_column)
 
     candidate_turn_keys = extraction_report.get("candidate_turn_keys")
     complete_turns = extraction_report.get("complete_turns")

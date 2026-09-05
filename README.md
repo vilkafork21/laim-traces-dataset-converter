@@ -34,3 +34,5 @@ ruff check .
 ```
 
 Порты указаны в descriptor. Разворачивать с согласованными потребителями v3; физический формат UMR остаётся v2 с дополнительными provenance-полями, проекция конвертера имеет версию v3.
+
+Объявленная evaluation.prediction_observable требуется независимо от scoring.method. Для итоговой человеческой оценки route_label публикуется как scenario, output_answer — как ответ; metadata содержит prediction_mapping. Отсутствующая величина даёт ready_for_scoring=false. Для accuracy сохраняется отдельная prediction-колонка, target остаётся только в reference.
