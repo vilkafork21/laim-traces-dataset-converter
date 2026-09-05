@@ -22,7 +22,7 @@
       "shape": "shape_model",
       "required": true,
       "order": 2,
-      "description": "laim-monitoring-metric.v2; assessment_mode задаёт тот же flat/dialogue-вариант, который adapter выбрал для reference UMR"
+      "description": "laim-monitoring-metric.v3; assessment_mode задаёт тот же flat/dialogue-вариант, который adapter выбрал для reference UMR"
     },
     {
       "name": "traces_validation_result",
@@ -49,7 +49,7 @@
       "in": false,
       "type": "dataframe",
       "shape": "shape_dataframe",
-      "order": 7,
+      "order": 5,
       "description": "Flat для qa/turn_with_history либо одна packed dialogue-строка на session_id для dialogue"
     },
     {
@@ -58,7 +58,7 @@
       "in": false,
       "type": "default",
       "shape": "shape_model",
-      "order": 8,
+      "order": 6,
       "description": "; data_readiness — готовность данных периода по карточке 6.3.2 (sufficient / limited / insufficient / failed) для агрегатора"
     },
     {
@@ -67,7 +67,7 @@
       "in": false,
       "type": "default",
       "shape": "shape_model",
-      "order": 9
+      "order": 7
     },
     {
       "name": "umr_artifact",
@@ -75,7 +75,7 @@
       "in": false,
       "type": "default",
       "shape": "shape_model",
-      "order": 10,
+      "order": 8,
       "description": "Monitoring-корзина в формате тестового датасета (тот же лист, что у порта monitoring_umr)"
     },
     {
@@ -84,7 +84,7 @@
       "in": false,
       "type": "default",
       "shape": "shape_model",
-      "order": 11,
+      "order": 9,
       "description": "Параметры записи XLSX для платформенного file-writer (путь HDFS, имя файла)"
     }
   ],
@@ -100,7 +100,8 @@
         "main.py",
         "table_io.py",
         "trace_dialogue.py",
-        "canonical.py"
+        "canonical.py",
+        "measurement.py"
       ],
       "functionName": "main",
       "functionParameters": [],

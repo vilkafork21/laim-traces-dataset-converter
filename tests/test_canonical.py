@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from measurement_fixture import reviewed_metric
+
 from typing import Any
 
 import pandas as pd
@@ -91,12 +93,12 @@ def _metric(method: str = "mean_criteria") -> dict[str, Any]:
                 "polarity": "direct",
             },
         ]
-    return {
+    return reviewed_metric({
         "contract_version": "laim-monitoring-metric.v2",
         "status": "computed",
         "assessment_mode": "qa",
         "scoring": {"method": method, "sources": sources},
-    }
+    })
 
 
 def _report() -> dict[str, object]:
@@ -118,14 +120,9 @@ def test_output_answer_is_always_final_agent_response() -> None:
     assert row["output_answer"] == "Финальный ответ"
     assert row["scenario"] == "domain-agent"
     assert result.report["ready_for_scoring"] is True
-    assert list(result.result.columns) == [
-        "scenario",
-        "session_id",
-        "query_id",
-        "input_query_count",
-        "input_query",
-        "output_answer",
-    ]
+    assert result.result["entry_trace_id"].tolist() == _turns()["entry_trace_id"].tolist()
+    assert result.result["exit_span_id"].tolist() == _turns()["exit_span_id"].tolist()
+    assert result.result["definition_id"].tolist() == [_metric()["definition_id"]]
 
 
 def test_query_id_is_scoped_by_session() -> None:
@@ -215,17 +212,14 @@ def test_flat_umr_matches_test_dataset_format() -> None:
         extraction_report=_report(),
     )
 
-    assert list(result.result.columns) == [
-        "scenario", "session_id", "query_id", "input_query_count",
-        "input_query", "output_answer",
-    ]
-    assert "reference_group_id" not in result.result
-    assert "turn_index" not in result.result
+    assert result.result["reference_group_id"].tolist() == ["session-1"]
+    assert result.result["turn_index"].tolist() == [1]
+    assert result.result["query_id"].tolist() == _turns()["turn_id"].tolist()
+    assert result.result["evaluation_ready"].tolist() == [True]
 
 
-def test_dialogue_umr_is_packed_per_session() -> None:
+def test_dialogue_keeps_each_turn_with_its_provenance() -> None:
     """dialogue: строка = сессия, реплики упакованы в dialogue-литерал."""
-    import ast
 
     turns = pd.DataFrame([
         _turn("t1", "s1", "q1", "a1"),
@@ -239,14 +233,15 @@ def test_dialogue_umr_is_packed_per_session() -> None:
     result = canonicalize_turns(turns, monitoring_metric=metric, extraction_report=report)
 
     frame = result.result
-    assert list(frame.columns) == ["scenario", "session_id", "dialogue"]
-    assert frame["session_id"].tolist() == ["s1", "s2"]
-    assert ast.literal_eval(frame["dialogue"].iloc[0]) == [("t1", "q1", "a1"), ("t2", "q2", "a2")]
-    assert result.report["rows"] == 2
+    assert frame["session_id"].tolist() == ["s1", "s1", "s2"]
+    assert frame["query_id"].tolist() == ["t1", "t2", "t3"]
+    assert frame["output_answer"].tolist() == ["a1", "a2", "a3"]
+    assert frame["turn_index"].tolist() == [1, 2, 1]
+    assert result.report["rows"] == 3
     assert result.report["groups"] == 2
 
 
-def test_dialogue_accuracy_prediction_must_be_constant_per_session() -> None:
+def test_dialogue_keeps_each_turn_prediction() -> None:
     """Меняющийся внутри сессии маршрут не публикуется как dialogue-предсказание."""
     turns = pd.DataFrame([
         _turn("t1", "s1", "q1", "a1"),
@@ -259,12 +254,12 @@ def test_dialogue_accuracy_prediction_must_be_constant_per_session() -> None:
 
     result = canonicalize_turns(turns, monitoring_metric=metric, extraction_report=report)
 
-    assert "class" not in result.result
-    assert result.report["missing_scoring_sources"] == ["class"]
-    assert result.report["ready_for_scoring"] is False
+    assert result.result["class"].tolist() == ["domain-agent", "other-agent"]
+    assert result.report["missing_scoring_sources"] == []
+    assert result.report["ready_for_scoring"] is True
 
 
-def test_dialogue_scenario_varying_inside_session_is_dropped() -> None:
+def test_dialogue_keeps_varying_scenarios() -> None:
     """Меняющийся внутри сессии маршрут — не характеристика диалога."""
     turns = pd.DataFrame([
         _turn("t1", "s1", "q1", "a1"),
@@ -277,5 +272,6 @@ def test_dialogue_scenario_varying_inside_session_is_dropped() -> None:
 
     result = canonicalize_turns(turns, monitoring_metric=metric, extraction_report=report)
 
-    assert "scenario" not in result.result
-    assert list(result.result.columns) == ["session_id", "dialogue"]
+    assert result.result["scenario"].tolist() == ["domain-agent", "other-agent"]
+    assert result.result["query_id"].tolist() == ["t1", "t2"]
+    assert result.result["turn_index"].tolist() == [1, 2]

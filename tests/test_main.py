@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import ast
+from measurement_fixture import reviewed_metric
+
 from io import BytesIO
 import json
 from pathlib import Path
@@ -17,8 +18,8 @@ NODE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _metric() -> dict[str, Any]:
-    return {
-        "contract_version": "laim-monitoring-metric.v2",
+    return reviewed_metric({
+        "contract_version": "laim-monitoring-metric.v3",
         "status": "computed",
         "assessment_mode": "qa",
         "scoring": {
@@ -32,7 +33,7 @@ def _metric() -> dict[str, Any]:
                 {"source_id": "target", "column_name": "GT", "role": "target"},
             ],
         },
-    }
+    })
 
 
 def _trace_quality() -> dict[str, object]:
@@ -84,6 +85,7 @@ def _span(
 ) -> dict[str, object]:
     return {
         "agent_id": "CI00000001",
+        "solution_version": "D-01.002.03",
         "trace_id": trace_id,
         "span_id": span_id,
         "session_id": "session-1",
@@ -162,15 +164,10 @@ def test_node_builds_accuracy_view_without_monitoring_gt() -> None:
     assert row["input_query"] == "Вопрос"
     assert row["output_answer"] == "Финальный ответ"
     assert row["class"] == "domain-agent"
-    assert list(result["monitoring_umr"].columns) == [
-        "scenario",
-        "session_id",
-        "query_id",
-        "input_query_count",
-        "input_query",
-        "output_answer",
-        "class",
-    ]
+    assert row["definition_id"] == _metric()["definition_id"]
+    assert row["response_source_path"]
+    assert row["evaluation_ready"]
+
     assert "GT" not in result["monitoring_umr"]
     assert result["processing_report"]["status"] == "complete"
     assert result["processing_report"]["ready_for_scoring"] is True
@@ -330,7 +327,7 @@ def test_all_assessors_metric_is_accepted() -> None:
 
     result = main(
         pd.DataFrame([entry, exit_row]),
-        metric,
+        reviewed_metric(metric),
         traces_validation_result=_trace_quality(),
     )
 
@@ -364,7 +361,9 @@ def test_excel_export_keeps_leading_equals_as_text() -> None:
     )
 
     workbook = result["umr_artifact"].book
-    cell = workbook[result["umr_artifact"].sheet_names[0]]["F2"]
+    sheet = workbook[result["umr_artifact"].sheet_names[0]]
+    column = next(cell.column for cell in sheet[1] if cell.value == "output_answer")
+    cell = sheet.cell(2, column)
     assert cell.value == '=HYPERLINK("https://example.test")'
     assert cell.data_type == "s"
 
@@ -442,7 +441,7 @@ def test_distributive_comes_from_selection() -> None:
     assert "secret" not in artifact_path
 
 
-def test_solution_version_from_selection_is_published_in_flat_output() -> None:
+def test_verified_trace_solution_version_is_published_in_flat_output() -> None:
     entry, exit_row = _fipa_pair()
 
     result = main(
@@ -472,26 +471,24 @@ def test_dialogue_reports_published_turns_separately_from_rows() -> None:
     )
     metric = _metric()
     metric["assessment_mode"] = "dialogue"
+    metric = reviewed_metric(metric)
 
     result = main(
         pd.DataFrame([first_entry, first_exit, second_entry, second_exit]),
-        metric,
+        reviewed_metric(metric),
         traces_validation_result=_trace_quality(),
         selection={"solution_version": "D-01.002.03"},
     )
 
     frame = result["monitoring_umr"]
-    assert list(frame.columns) == [
-        "solution_version", "scenario", "session_id", "dialogue", "class",
-    ]
-    assert frame["solution_version"].tolist() == ["D-01.002.03"]
-    assert ast.literal_eval(frame["dialogue"].iloc[0]) == [
-        ("conversation-1|request-1", "Вопрос", "Финальный ответ"),
-        ("conversation-1|request-2", "Второй вопрос", "Второй ответ"),
-    ]
+    assert frame["definition_id"].tolist() == [metric["definition_id"]] * 2
+    assert frame["response_source_path"].str.len().gt(0).all()
+
+    assert frame["solution_version"].tolist() == ["D-01.002.03", "D-01.002.03"]
+    assert frame["query_id"].tolist() == ["conversation-1|request-1", "conversation-1|request-2"]
+    assert frame["output_answer"].tolist() == ["Финальный ответ", "Второй ответ"]
     conservation = result["processing_report"]["conservation"]
-    assert conservation["published_turns"] == 2
-    assert conservation["published_rows"] == 1
+    assert conservation["published_turns"] == conservation["published_rows"] == 2
     assert conservation["unpublished_turns"] == 0
 
 
@@ -552,7 +549,7 @@ def test_not_computable_skips_traces_and_publishes_empty_artifacts(
 
     monkeypatch.setattr(converter, "read_table", fail_on_trace_read)
     metric = {
-        "contract_version": "laim-monitoring-metric.v2",
+        "contract_version": "laim-monitoring-metric.v3",
         "status": "not_computable",
         "reason_code": "official_baseline_missing",
         "reason": "Validation report не содержит официальный baseline",
@@ -562,14 +559,8 @@ def test_not_computable_skips_traces_and_publishes_empty_artifacts(
 
     frame = result["monitoring_umr"]
     assert frame.empty
-    assert list(frame.columns) == [
-        "scenario",
-        "session_id",
-        "query_id",
-        "input_query_count",
-        "input_query",
-        "output_answer",
-    ]
+    assert list(frame.columns) == ["scenario", "session_id", "query_id", "input_query_count", "input_query", "output_answer"]
+
     parquet = pd.read_parquet(BytesIO(result["parquet_test_dataset"]))
     assert parquet.empty and list(parquet.columns) == list(frame.columns)
     excel = pd.read_excel(result["umr_artifact"])
@@ -594,7 +585,7 @@ def test_monitoring_metric_rejects_unknown_status() -> None:
     metric = _metric()
     metric["status"] = "pending"
 
-    with pytest.raises(ValueError, match="computed или not_computable"):
+    with pytest.raises(ValueError, match="status"):
         main(object(), metric)
 
 
@@ -603,7 +594,7 @@ def test_monitoring_metric_rejects_unknown_status() -> None:
 @pytest.mark.parametrize("missing_field", ["reason_code", "reason"])
 def test_not_computable_requires_reason_fields(missing_field: str) -> None:
     metric = {
-        "contract_version": "laim-monitoring-metric.v2",
+        "contract_version": "laim-monitoring-metric.v3",
         "status": "not_computable",
         "reason_code": "official_baseline_missing",
         "reason": "Официальный baseline отсутствует",
@@ -614,3 +605,17 @@ def test_not_computable_requires_reason_fields(missing_field: str) -> None:
         main(object(), metric)
 
 
+
+
+@pytest.mark.parametrize("versions", [None, ["old-version", "old-version"],
+                                     ["D-01.002.03", "old-version"], [None, "D-01.002.03"]])
+def test_declared_version_cannot_relabel_unverified_or_old_traces(versions):
+    frame = pd.DataFrame(_fipa_pair())
+    if versions is None:
+        frame = frame.drop(columns="solution_version")
+    else:
+        frame["solution_version"] = versions
+    result = main(frame, _metric(), traces_validation_result=_trace_quality(),
+                  selection={"solution_version": "D-01.002.03"})
+    assert result["monitoring_umr"].empty
+    assert result["processing_report"]["reason_code"] == "source_version_unverified"

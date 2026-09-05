@@ -9,7 +9,7 @@ import pandas as pd
 
 from trace_dialogue import EXTRACTION_CONTRACT, TURN_COLUMNS
 
-CANONICALIZATION_CONTRACT = "laim-monitoring-turn-projection.v2"
+CANONICALIZATION_CONTRACT = "laim-monitoring-turn-projection.v3"
 
 # Поля UMR по «Формату тестового датасета» УМР (laim-umr.v2): scenario —
 # классифицирующий признак запроса, для роутера это наблюдаемая метка маршрута.
@@ -89,6 +89,20 @@ def canonicalize_turns(
         }
     )
 
+    flat["reference_group_id"] = flat["session_id"]
+    flat["turn_index"] = flat.groupby("session_id", sort=False).cumcount() + 1
+    flat["dataset_role"] = "monitoring"
+    flat["definition_id"] = monitoring_metric["definition_id"]
+    for column in TURN_COLUMNS:
+        if column not in flat and column not in {"agent_response", "turn_id", "route_label"}:
+            flat[column] = frame[column]
+    flat["evaluation_evidence"] = "{}"
+    # Профили пока доказывают только пару запрос/ответ и маршрут.
+    # Историю и факты нельзя восстанавливать из произвольных внутренних JSON.
+    missing_evidence = monitoring_metric["evaluation"]["required_evidence"]
+    flat["evaluation_ready"] = not missing_evidence
+    flat["evaluation_reason"] = ("Не поддержаны обязательные свидетельства: " + ", ".join(missing_evidence)) if missing_evidence else ""
+
     # Для accuracy monitoring поставляет только наблюдаемое prediction. Target
     # остаётся в эталонной корзине, где baskets-adapter вычисляет main_metric.
     prediction_mapping = None
@@ -107,12 +121,14 @@ def canonicalize_turns(
             raise MonitoringCanonicalizationError(
                 f"target-колонка {target_column!r} конфликтует с полем UMR"
             )
-        if not _blank_mask(scenario).any():
-            flat[prediction_column] = scenario
+        observable = monitoring_metric["evaluation"]["prediction_observable"]
+        observed = scenario if observable == "route_label" else answers
+        if not _blank_mask(observed).any():
+            flat[prediction_column] = observed
             prediction_mapping = {
                 "column_name": prediction_column,
-                "source": "route_label",
-                "source_paths": sorted(set(frame["route_source_path"].astype(str))),
+                "source": observable,
+                "source_paths": sorted(set(frame["route_source_path" if observable == "route_label" else "response_source_path"].astype(str))),
             }
         else:
             missing_scoring_sources.append(prediction_column)
@@ -129,15 +145,9 @@ def canonicalize_turns(
             "candidate_turn_keys противоречит complete_turns"
         )
 
-    if assessment_mode == "dialogue":
-        result, dropped_prediction = _pack_dialogue(flat, prediction_column)
-        if dropped_prediction:
-            prediction_mapping = None
-            missing_scoring_sources.append(dropped_prediction)
-    else:
-        result = flat
-
-    ready_for_scoring = not missing_scoring_sources
+    result = flat
+    ready_for_scoring = not missing_scoring_sources and not missing_evidence
+    result["evaluation_ready"] = ready_for_scoring
 
     repeated_counts = answers.value_counts()
     repeated_threshold = max(len(result) * 0.01, 5)
@@ -179,41 +189,3 @@ def canonicalize_turns(
         report=report,
         filter_report=filter_report,
     )
-
-
-def _pack_dialogue(
-    flat: pd.DataFrame, prediction_column: str | None
-) -> tuple[pd.DataFrame, str | None]:
-    """Строка = сессия по «Варианту для диалога»: реплики (в наблюдённом
-    порядке) упакованы в dialogue-литерал троек, как в эталонной корзине.
-
-    Возвращает packed-фрейм и имя prediction-колонки, если её пришлось
-    опустить: предсказание, меняющееся внутри сессии, — не dialogue-значение.
-    """
-    records = []
-    dropped_prediction = None
-    scenario_constant = True
-    for session_id, group in flat.groupby("session_id", sort=False):
-        dialogue = [
-            (str(row.query_id), str(row.input_query), str(row.output_answer))
-            for row in group.itertuples()
-        ]
-        scenario_constant = scenario_constant and group["scenario"].nunique() == 1
-        record = {
-            "scenario": group["scenario"].iloc[0],
-            "session_id": str(session_id),
-            "dialogue": repr(dialogue),
-        }
-        if prediction_column is not None and prediction_column in flat:
-            values = set(group[prediction_column])
-            if len(values) == 1:
-                record[prediction_column] = group[prediction_column].iloc[0]
-            else:
-                dropped_prediction = prediction_column
-        records.append(record)
-    result = pd.DataFrame(records)
-    if not scenario_constant:
-        result = result.drop(columns=["scenario"])
-    if dropped_prediction and dropped_prediction in result:
-        result = result.drop(columns=[dropped_prediction])
-    return result, dropped_prediction

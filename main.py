@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from measurement import validate_measurement
+
 from collections import Counter
 from datetime import datetime
 from hashlib import sha256
@@ -170,8 +172,7 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
 def _validate_metric(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("monitoring_metric должен быть JSON object")
-    if value.get("contract_version") != "laim-monitoring-metric.v2":
-        raise ValueError("Ожидается laim-monitoring-metric.v2")
+    value = validate_measurement(value, require_computed=False)
     status = value.get("status")
     if status not in {"computed", "not_computable"}:
         raise ValueError(
@@ -502,6 +503,12 @@ def main(
             reason_code=metric["reason_code"], reason=metric["reason"],
             trace_check=_validate_trace_check(None, True), minimum=minimum,
         )
+    if requested_agent and requested_agent != metric["basket_id"]:
+        raise ValueError("selection.agent_ci не соответствует monitoring_metric.basket_id")
+    if solution_version and solution_version != metric["solution_version"]:
+        raise ValueError("selection.solution_version не соответствует утверждённому определению")
+    solution_version = metric["solution_version"]
+    requested_agent = metric["basket_id"]
     trace_check = _validate_trace_check(traces_validation_result, ignore_traces_checks)
     if trace_check["status"] == "failed":
         return _not_ready_result(
@@ -514,6 +521,17 @@ def main(
     stage_started = perf_counter()
     spans = read_table(monitoring_traces, "monitoring_traces")
     read_seconds = perf_counter() - stage_started
+    source_rows = spans
+    if "agent_id" in spans.columns:
+        source_rows = spans.loc[spans["agent_id"].astype(str).str.strip().eq(requested_agent)]
+    versions = source_rows.get("solution_version")
+    if versions is None or not versions.fillna("").eq(solution_version).all():
+        return _not_ready_result(
+            metric, requested_agent, distributive, solution_version,
+            reason_code="source_version_unverified",
+            reason="solution_version исходных spans отсутствует или не совпадает с определением КМ",
+            trace_check=trace_check, minimum=minimum,
+        )
     logger.info(
         "LAIM traces dataset converter: rows=%d, agent_id=%s, mode=%s",
         len(spans),
@@ -525,6 +543,8 @@ def main(
     extracted = extract_turns(
         spans,
         ExtractionConfig(
+            observation_profile=metric["evaluation"]["observation_profile"],
+            external_party=metric["evaluation"].get("external_party", ""),
             agent_id=requested_agent, max_issue_examples=_MAX_ISSUE_EXAMPLES
         ),
     )
@@ -569,6 +589,10 @@ def main(
     )
     canonical_seconds = perf_counter() - stage_started
     monitoring_umr = canonical.result
+    if partial_source:
+        monitoring_umr["evaluation_ready"] = False
+        monitoring_umr["evaluation_reason"] = "Неполное извлечение: состав оцениваемой популяции не подтверждён"
+        canonical.report["ready_for_scoring"] = False
     if solution_version:
         monitoring_umr.insert(0, "solution_version", solution_version)
 

@@ -23,9 +23,6 @@ logger = logging.getLogger(__name__)
 EXTRACTION_CONTRACT = "laim-trace-turn-extraction.v2"
 FIPA_SCHEMA = "fipa_acl_v1"
 AEF_BOUNDARY_SCHEMA = "aef_boundary_v1"
-AEF_START_AGENT_SCHEMA = "aef_start_agent_v1"
-AEF_PARENT_BOUNDARY_SCHEMA = "aef_parent_boundary_v1"
-AEF_SEMANTIC_TERMINAL_SCHEMA = "aef_semantic_terminal_v1"
 STATE_JSON_SCHEMA = "state_json_v1"
 
 _BOUNDARY_KINDS = {"input_request", "start_agent"}
@@ -90,10 +87,16 @@ class TraceExtractionError(ValueError):
 class ExtractionConfig:
     """Стабильная конфигурация ядра извлечения."""
 
+    observation_profile: str
+    external_party: str = ""
     agent_id: str = ""
     max_issue_examples: int = 100
 
     def __post_init__(self) -> None:
+        if self.observation_profile not in ("fipa_external_reply_v1", "aef_boundary_v1", "state_single_request_v1"):
+            raise TraceExtractionError(f"Неизвестный observation_profile: {self.observation_profile!r}")
+        if self.observation_profile == "fipa_external_reply_v1" and not self.external_party.strip():
+            raise TraceExtractionError("FIPA требует утверждённое имя external_party")
         if (
             isinstance(self.max_issue_examples, bool)
             or not isinstance(self.max_issue_examples, int)
@@ -533,23 +536,6 @@ def _aef_turn(record: dict[str, object]) -> dict[str, Any] | None:
     query, query_path = _request_text(record.get("input_text"))
     response, response_path = _response_text(record.get("output_text"))
     schema_version = AEF_BOUNDARY_SCHEMA
-    if _identifier(record.get("aef_kind")).casefold() == "start_agent":
-        if query_path == "input_text.text":
-            schema_version = AEF_START_AGENT_SCHEMA
-        input_payload = _mapping(record.get("input_text"))
-        output_payload = _mapping(record.get("output_text"))
-        for key in ("goal", "task", "text"):
-            fallback = _text((input_payload or {}).get(key))
-            if not query and fallback:
-                query, query_path = fallback, f"input_text.{key}"
-                schema_version = AEF_START_AGENT_SCHEMA
-                break
-        for key in ("summary", "error"):
-            fallback = _text((output_payload or {}).get(key))
-            if not response and fallback:
-                response, response_path = fallback, f"output_text.{key}"
-                schema_version = AEF_START_AGENT_SCHEMA
-                break
     if not query or not response or _semantic(query) == _semantic(response):
         return None
     trace_id = _identifier(record.get("trace_id"))
@@ -628,63 +614,11 @@ def _parse_fipa_rows(candidates: pd.DataFrame, events: _FipaEvents) -> list[_Fip
     return rows
 
 
-def _conversation_initiators(rows: list[_FipaRow]) -> dict[str, int]:
-    """Контрагенты агента — отправители, чей request в conversation приходит раньше,
-    чем агент сам отправляет им request.
-
-    Человек или вышестоящий агент открывает разговор своим request; нижестоящий
-    агент получает request от этого агента первым и шлёт свои (уточнения) уже
-    внутри разговора. Правило считается по строгому большинству conversation отправителя,
-    поэтому обрезка окна выгрузки на отдельных разговорах его не меняет. Имена
-    endpoint не участвуют.
-    """
-    incoming_first: dict[tuple[str, str], tuple[int, str, str]] = {}
-    outgoing_first: dict[tuple[str, str], tuple[int, str, str]] = {}
-    self_names: Counter[str] = Counter()
-    for row in rows:
-        conversation_id = row.conversation_id
-        if not conversation_id:
-            continue
-        if row.incoming is not None:
-            self_names[_identifier(row.incoming.get("receiver"))] += 1
-        order = (
-            row.time_ns if row.time_ns is not None else 0,
-            _identifier(row.record.get("trace_id")),
-            _identifier(row.record.get("span_id")),
-        )
-        if _is_request(row.incoming):
-            sender = _identifier((row.incoming or {}).get("sender"))
-            if sender:
-                key = (conversation_id, sender)
-                incoming_first[key] = min(incoming_first.get(key, order), order)
-        if _is_request(row.outgoing):
-            receiver = _identifier((row.outgoing or {}).get("receiver"))
-            if receiver:
-                key = (conversation_id, receiver)
-                outgoing_first[key] = min(outgoing_first.get(key, order), order)
-    # Имя самого агента — получатель его входящих; оно не может быть контрагентом.
-    self_name = self_names.most_common(1)[0][0] if self_names else ""
-    conversations: Counter[str] = Counter()
-    leading: Counter[str] = Counter()
-    for (conversation_id, sender), first_in in incoming_first.items():
-        if sender == self_name:
-            continue
-        conversations[sender] += 1
-        first_out = outgoing_first.get((conversation_id, sender))
-        if first_out is None or first_in <= first_out:
-            leading[sender] += 1
-    return {
-        sender: count
-        for sender, count in leading.most_common()
-        if 2 * count > conversations[sender]
-    }
-
-
-def _collect_fipa_events(candidates: pd.DataFrame) -> _FipaEvents:
+def _collect_fipa_events(candidates: pd.DataFrame, external_party: str) -> _FipaEvents:
     """Разложить кандидатов на входы/выходы контрагентов и non-FIPA записи."""
     events = _FipaEvents()
     rows = _parse_fipa_rows(candidates, events)
-    events.counterparts = _conversation_initiators(rows)
+    events.counterparts = {external_party: len({row.conversation_id for row in rows})} if external_party else {}
     for row in rows:
         record = row.record
         trace_id = _identifier(record.get("trace_id"))
@@ -919,22 +853,15 @@ def _collect_aef_turns(
 ) -> tuple[list[dict[str, Any]], int]:
     """Явные пары request/response на внешней границе non-FIPA trace.
 
-    start_agent считается внешней границей только при отсутствии input_request
-    или HTTP boundary в trace: внутренний агент не должен подменять внешний ответ.
+    Профиль требует input_request; отсутствие внешней границы нельзя
+    компенсировать внутренним start_agent или отдельно найденным текстом.
     """
 
-    outer_traces = set(events.traces) | {
-        _identifier(record.get("trace_id"))
-        for record in events.non_fipa_records
-        if _is_outer_boundary(record)
-    }
     turns: list[dict[str, Any]] = []
     incomplete = 0
     for record in events.non_fipa_records:
         trace_id = _identifier(record.get("trace_id"))
-        kind = _identifier(record.get("aef_kind")).casefold()
-        is_start_fallback = kind == "start_agent" and trace_id not in outer_traces
-        if not (_is_outer_boundary(record) or is_start_fallback):
+        if _identifier(record.get("aef_kind")).casefold() != "input_request":
             continue
         events.traces.add(trace_id)
         turn = _aef_turn(record)
@@ -965,221 +892,16 @@ def _collect_aef_turns(
     return turns, incomplete
 
 
-def _parent_boundary_turns(
-    frame: pd.DataFrame,
-    covered_traces: set[str],
-    issues: list[dict[str, str]],
-) -> tuple[list[dict[str, Any]], int]:
-    """Turn из start_agent и его непосредственной внешней AEF-границы."""
-    turns: list[dict[str, Any]] = []
-    incomplete = 0
-    columns = list(frame.columns)
-    for trace_id, group in frame.groupby("trace_id", sort=False):
-        trace_id = _identifier(trace_id)
-        if not trace_id or trace_id in covered_traces:
-            continue
-        records = [
-            _row_record(row, columns)
-            for row in group.itertuples(index=False, name=None)
-        ]
-        by_span_id = {
-            _identifier(record.get("span_id")): record
-            for record in records
-            if _identifier(record.get("span_id"))
-        }
-        candidates = []
-        has_topology = False
-        for start in records:
-            if _identifier(start.get("aef_kind")).casefold() != "start_agent":
-                continue
-            parent = by_span_id.get(_identifier(start.get("parent_span_id")))
-            if parent is None or not _is_outer_boundary(parent):
-                continue
-            has_topology = True
-            carrier_query, _ = _request_text(start.get("input_text"))
-            incoming, incoming_path = _incoming_envelope(
-                _mapping(parent.get("input_text"))
-            )
-            outgoing, outgoing_path = _outgoing_envelope(
-                _mapping(parent.get("output_text"))
-            )
-            incoming_parts = _message_parts(incoming)
-            boundary_query = _message_text(incoming_parts)
-            label, label_index, query_parts = _split_label(incoming_parts)
-            query = _message_text(query_parts)
-            response = _message_text(_message_parts(outgoing))
-            start_session = _identifier(start.get("session_id"))
-            parent_session = _identifier(parent.get("session_id"))
-            time_ns = _integer(parent.get("start_time_ns"))
-            if not (
-                carrier_query
-                and _semantic(carrier_query) == _semantic(boundary_query)
-                and query
-                and response
-                and _semantic(query) != _semantic(response)
-                and start_session
-                and start_session == parent_session
-                and time_ns is not None
-            ):
-                continue
-            span_id = _identifier(start.get("span_id"))
-            candidates.append(
-                {
-                    "turn_id": f"parent:{trace_id}:{span_id}",
-                    "session_id": start_session,
-                    "input_query": query,
-                    "agent_response": response,
-                    "route_label": label,
-                    "schema_family": "aef_parent_boundary",
-                    "schema_version": AEF_PARENT_BOUNDARY_SCHEMA,
-                    "entry_trace_id": trace_id,
-                    "exit_trace_id": trace_id,
-                    "entry_span_id": _identifier(parent.get("span_id")),
-                    "exit_span_id": _identifier(parent.get("span_id")),
-                    "entry_time_ns": time_ns,
-                    "exit_time_ns": _integer(parent.get("end_time_ns")) or time_ns,
-                    "same_trace": True,
-                    "same_session": True,
-                    "route_chain_complete": False,
-                    "turn_latency_ms": 0.0,
-                    "query_source_path": (
-                        f"{incoming_path}.content.message[*].value"
-                    ),
-                    "response_source_path": (
-                        f"{outgoing_path}.content.message[*].value"
-                    ),
-                    "route_source_path": (
-                        f"{incoming_path}.content.message[{label_index}].value"
-                        if label
-                        else ""
-                    ),
-                }
-            )
-        variants = {
-            (
-                _semantic(candidate["input_query"]),
-                _semantic(candidate["agent_response"]),
-            )
-            for candidate in candidates
-        }
-        if len(variants) == 1:
-            turns.append(candidates[0])
-        elif has_topology:
-            incomplete += 1
-            issues.append(
-                _issue(
-                    "parent_boundary_incomplete",
-                    schema_version=AEF_PARENT_BOUNDARY_SCHEMA,
-                    trace_id=trace_id,
-                    details=f"candidate_variants={len(variants)}",
-                )
-            )
-    return turns, incomplete
-
-
-def _semantic_terminal_turns(
-    frame: pd.DataFrame,
-    covered_traces: set[str],
-    route_labels: set[str],
-) -> list[dict[str, Any]]:
-    """Финальный ответ из явного top-level terminal-поля дочернего span."""
-    turns = []
-    for trace_id, group in frame.groupby("trace_id", sort=False):
-        trace_id = _identifier(trace_id)
-        if not trace_id or trace_id in covered_traces:
-            continue
-        starts = group.loc[
-            _string_series(group["aef_kind"]).str.casefold().eq("start_agent")
-        ].sort_values(["start_time_ns", "span_id"], kind="stable")
-        carriers = []
-        for record in starts.to_dict(orient="records"):
-            query, query_path = _request_text(record.get("input_text"))
-            if query:
-                carriers.append((record, query, query_path))
-        query_variants = {_semantic(query) for _, query, _ in carriers}
-        if len(query_variants) != 1:
-            continue
-        start, carrier_query, query_path = carriers[0]
-        session_id = _identifier(start.get("session_id"))
-        if not session_id:
-            continue
-        route = ""
-        query = carrier_query
-        prefix, separator, remainder = carrier_query.partition(" ")
-        if separator and prefix in route_labels and remainder.strip():
-            route = prefix
-            query = remainder.strip()
-
-        answers: dict[str, tuple[str, str]] = {}
-        for record in group.to_dict(orient="records"):
-            if _identifier(record.get("session_id")) != session_id:
-                continue
-            payload = _mapping(record.get("output_text"))
-            if payload is None:
-                continue
-            for key in _TERMINAL_ANSWER_KEYS:
-                raw = _json_value(payload.get(key))
-                answer = _text(raw)
-                if not answer and isinstance(raw, list):
-                    answer = next(
-                        (_text(item) for item in raw if _text(item)), ""
-                    )
-                semantic = _semantic(answer)
-                if semantic and semantic not in {
-                    _semantic(carrier_query),
-                    _semantic(query),
-                }:
-                    answers.setdefault(
-                        semantic,
-                        (
-                            answer,
-                            f"output_text.{key}",
-                        ),
-                    )
-        if len(answers) != 1:
-            continue
-        answer, response_path = next(iter(answers.values()))
-        span_id = _identifier(start.get("span_id"))
-        time_ns = _integer(start.get("start_time_ns"))
-        if not session_id or not span_id or time_ns is None:
-            continue
-        turns.append(
-            {
-                "turn_id": f"terminal:{trace_id}:{span_id}",
-                "session_id": session_id,
-                "input_query": query,
-                "agent_response": answer,
-                "route_label": route,
-                "schema_family": "aef_semantic_terminal",
-                "schema_version": AEF_SEMANTIC_TERMINAL_SCHEMA,
-                "entry_trace_id": trace_id,
-                "exit_trace_id": trace_id,
-                "entry_span_id": span_id,
-                "exit_span_id": span_id,
-                "entry_time_ns": time_ns,
-                "exit_time_ns": time_ns,
-                "same_trace": True,
-                "same_session": True,
-                "route_chain_complete": False,
-                "turn_latency_ms": 0.0,
-                "query_source_path": query_path,
-                "response_source_path": response_path,
-                "route_source_path": query_path if route else "",
-            }
-        )
-    return turns
-
-
 def _state_json_turns(
     frame: pd.DataFrame, covered_traces: set[str]
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int, int]:
     """Turn'ы langgraph-агентов: диалог лежит в state_json внутри input_text.
 
-    Финальное состояние — спан со stage exit/__end__: вопрос — последняя
-    user-реплика messages, ответ — message_to_user, маршрут — product_agent.
-    Дополняет только трейсы, не покрытые FIPA/AEF, чтобы не дублировать turn'ы.
+    Профиль допускает ровно один логический запрос на trace. Различающиеся
+    финальные состояния неоднозначны: выбирать последнее по времени нельзя.
     """
     exits: dict[str, dict[str, Any]] = {}
+    ambiguous: set[str] = set()
     inputs = frame["input_text"].astype(str)
     outputs = frame["output_text"].astype(str)
     likely = (
@@ -1212,9 +934,12 @@ def _state_json_turns(
             continue
         time_ns = _integer(record.get("start_time_ns")) or 0
         current = exits.get(trace_id)
-        if current is not None and current["entry_time_ns"] >= time_ns:
-            continue
         route = _text(state.get("product_agent"))
+        if current is not None:
+            if (current["input_query"], current["agent_response"], current["route_label"], current["session_id"]) != (
+                    query, answer, route, _identifier(record.get("session_id"))):
+                ambiguous.add(trace_id)
+            continue
         span_id = _identifier(record.get("span_id"))
         exits[trace_id] = {
             "turn_id": f"state:{trace_id}:{span_id}",
@@ -1238,9 +963,9 @@ def _state_json_turns(
             "response_source_path": f"{source}.message_to_user",
             "route_source_path": f"{source}.product_agent" if route else "",
         }
-    turns = list(exits.values())
+    turns = [turn for trace, turn in exits.items() if trace not in ambiguous]
     missing_sessions = sum(not turn["session_id"] for turn in turns)
-    return [turn for turn in turns if turn["session_id"]], missing_sessions
+    return [turn for turn in turns if turn["session_id"]], missing_sessions, len(ambiguous)
 
 
 def _ordered_turns(turns: list[dict[str, Any]]) -> pd.DataFrame:
@@ -1265,7 +990,8 @@ def extract_turns(
         raise TypeError("spans должен быть pandas.DataFrame")
     if spans.empty:
         raise TraceExtractionError("Выгрузка трейсов пуста")
-    config = config or ExtractionConfig()
+    if config is None:
+        raise TraceExtractionError("Нужен утверждённый observation_profile")
     required = {
         "trace_id",
         "span_id",
@@ -1288,91 +1014,28 @@ def extract_turns(
     candidates = frame.loc[_candidate_mask(frame)]
     issues: list[dict[str, str]] = []
 
-    events = _collect_fipa_events(candidates)
-    fipa_keys = len(set(events.entries) | set(events.exits))
-    fipa_turns, fipa_stats = _join_fipa_turns(events, issues)
-    aef_turns, incomplete_boundaries = _collect_aef_turns(events, issues)
-
-    covered_traces = {
-        _identifier(turn["entry_trace_id"]) for turn in fipa_turns + aef_turns
-    } | {_identifier(turn["exit_trace_id"]) for turn in fipa_turns + aef_turns}
-    parent_turns, incomplete_parent_boundaries = _parent_boundary_turns(
-        frame, covered_traces, issues
-    )
-    covered_traces |= {
-        _identifier(turn["entry_trace_id"]) for turn in parent_turns
-    }
-    route_labels = {
-        _identifier(turn["route_label"])
-        for turn in fipa_turns + parent_turns
-        if _identifier(turn["route_label"])
-    }
-    terminal_turns = _semantic_terminal_turns(
-        frame, covered_traces, route_labels
-    )
-    covered_traces |= {
-        _identifier(turn["entry_trace_id"]) for turn in terminal_turns
-    }
-    state_turns, state_session_missing = _state_json_turns(frame, covered_traces)
+    events = _FipaEvents()
+    fipa_turns = []
+    aef_turns = []
+    state_turns = []
+    state_session_missing = 0
+    state_ambiguous_traces = 0
+    incomplete_boundaries = 0
+    fipa_keys = 0
+    fipa_stats = {key: 0 for key in (
+        "entry_without_exit", "exit_without_entry", "conflicting_entry_keys",
+        "conflicting_exit_keys", "cross_trace_turns", "session_mismatches", "route_chain_complete_turns")}
+    if config.observation_profile == "fipa_external_reply_v1":
+        events = _collect_fipa_events(candidates, config.external_party)
+        fipa_keys = len(set(events.entries) | set(events.exits))
+        fipa_turns, fipa_stats = _join_fipa_turns(events, issues)
+    elif config.observation_profile == "aef_boundary_v1":
+        boundaries = candidates.loc[candidates["aef_kind"].astype(str).str.casefold().eq("input_request")]
+        events = _collect_fipa_events(boundaries, "")
+        aef_turns, incomplete_boundaries = _collect_aef_turns(events, issues)
+    else:
+        state_turns, state_session_missing, state_ambiguous_traces = _state_json_turns(frame, set())
     state_traces = {turn["entry_trace_id"] for turn in state_turns}
-
-    fallback_turns = parent_turns + terminal_turns + state_turns
-    resolved_boundary_traces = {
-        _identifier(turn["entry_trace_id"]) for turn in fallback_turns
-    }
-    resolved_boundary_issues = [
-        issue
-        for issue in issues
-        if issue["issue_code"] == "boundary_pair_incomplete"
-        and issue["trace_id"] in resolved_boundary_traces
-    ]
-    if resolved_boundary_issues:
-        issues = [
-            issue for issue in issues if issue not in resolved_boundary_issues
-        ]
-        incomplete_boundaries -= len(resolved_boundary_issues)
-    fallback_queries = {
-        (turn["entry_trace_id"], _semantic(turn["input_query"]))
-        for turn in fallback_turns
-    }
-    fallback_answers = {
-        (turn["exit_trace_id"], _semantic(turn["agent_response"]))
-        for turn in fallback_turns
-    }
-    resolved_entry_ids = {
-        f"{conversation_id}|{request_id}"
-        for (conversation_id, request_id), entries in events.entries.items()
-        if (conversation_id, request_id) not in events.exits
-        and any(
-            (entry["trace_id"], _semantic(entry["input_query"]))
-            in fallback_queries
-            for entry in entries
-        )
-    }
-    resolved_exit_ids = {
-        f"{conversation_id}|{request_id}"
-        for (conversation_id, request_id), exits in events.exits.items()
-        if (conversation_id, request_id) not in events.entries
-        and any(
-            (exit_event["trace_id"], _semantic(exit_event["agent_response"]))
-            in fallback_answers
-            for exit_event in exits
-        )
-    }
-    resolved_fipa_ids = resolved_entry_ids | resolved_exit_ids
-    if resolved_fipa_ids:
-        issues = [
-            issue
-            for issue in issues
-            if not (
-                issue["issue_code"]
-                in {"entry_without_exit", "exit_without_entry"}
-                and issue["turn_id"] in resolved_fipa_ids
-            )
-        ]
-        fipa_keys -= len(resolved_fipa_ids)
-        fipa_stats["entry_without_exit"] -= len(resolved_entry_ids)
-        fipa_stats["exit_without_entry"] -= len(resolved_exit_ids)
 
     candidate_traces = set(_string_series(candidates["trace_id"]))
     unrecognized = set(trace_values) - events.traces - state_traces
@@ -1396,7 +1059,7 @@ def extract_turns(
             )
         )
     turns = _ordered_turns(
-        fipa_turns + aef_turns + parent_turns + terminal_turns + state_turns
+        fipa_turns + aef_turns + state_turns
     )
     issue_frame = pd.DataFrame(issues, columns=_ISSUE_COLUMNS)
     candidate_turn_keys = (
@@ -1406,14 +1069,14 @@ def extract_turns(
         + events.failures_without_text
         + len(aef_turns)
         + incomplete_boundaries
-        + len(parent_turns)
-        + len(terminal_turns)
         + len(state_turns)
         + state_session_missing
+        + state_ambiguous_traces
     )
     complete_turns = len(turns)
     report = {
         "contract_version": EXTRACTION_CONTRACT,
+        "observation_profile": config.observation_profile,
         "agent_id": agent_id,
         "input_rows": int(len(spans)),
         **dropped_rows,
@@ -1425,14 +1088,10 @@ def extract_turns(
         "fipa_extraction_coverage": len(fipa_turns) / fipa_keys if fipa_keys else 0.0,
         "aef_candidate_boundaries": int(len(aef_turns) + incomplete_boundaries),
         "aef_complete_turns": int(len(aef_turns)),
-        "parent_boundary_candidate_turns": int(
-            len(parent_turns) + incomplete_parent_boundaries
-        ),
-        "parent_boundary_complete_turns": int(len(parent_turns)),
-        "semantic_terminal_complete_turns": int(len(terminal_turns)),
-        "state_json_candidate_turns": int(len(state_turns) + state_session_missing),
+        "state_json_candidate_turns": int(len(state_turns) + state_session_missing + state_ambiguous_traces),
         "state_json_complete_turns": int(len(state_turns)),
         "state_json_session_missing": int(state_session_missing),
+        "state_json_ambiguous_traces": int(state_ambiguous_traces),
         "candidate_turn_keys": int(candidate_turn_keys),
         "complete_turns": int(complete_turns),
         "extraction_coverage": (
