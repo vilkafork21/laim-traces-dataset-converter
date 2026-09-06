@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import ast
+from measurement_fixture import reviewed_metric
+
 from io import BytesIO
 import json
 from pathlib import Path
@@ -11,14 +12,15 @@ import pandas as pd
 import pytest
 
 from main import main
+from dataset_identity import frame_identity
 
 
 NODE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _metric() -> dict[str, Any]:
-    return {
-        "contract_version": "laim-monitoring-metric.v2",
+    return reviewed_metric({
+        "contract_version": "laim-monitoring-metric.v3",
         "status": "computed",
         "assessment_mode": "qa",
         "scoring": {
@@ -32,10 +34,10 @@ def _metric() -> dict[str, Any]:
                 {"source_id": "target", "column_name": "GT", "role": "target"},
             ],
         },
-    }
+    })
 
 
-def _trace_quality() -> dict[str, object]:
+def _trace_quality(frame: pd.DataFrame | None = None) -> dict[str, object]:
     criteria = {
         f"K{i}": {
             "result": "пройден",
@@ -55,6 +57,9 @@ def _trace_quality() -> dict[str, object]:
         "title": "Диагностика структуры телеметрии",
     }
     return {
+        "contract_version": "laim-traces-validation.v2",
+        "counting_policy": "attribute_cells_and_max_mandatory_v1",
+        "source_dataset_id": frame_identity(frame if frame is not None else pd.DataFrame()),
         "schema": {"критичных нарушено": 0},
         "quality": [
             {
@@ -84,6 +89,7 @@ def _span(
 ) -> dict[str, object]:
     return {
         "agent_id": "CI00000001",
+        "solution_version": "D-01.002.03",
         "trace_id": trace_id,
         "span_id": span_id,
         "session_id": "session-1",
@@ -141,6 +147,7 @@ def _fipa_pair(
             "outgoing": {
                 "receiver": "agent_human",
                 "in_reply_to": request_id,
+                "performative": "inform",
                 "content": {"message": [{"type": "text", "value": answer}]},
             }
         },
@@ -155,22 +162,17 @@ def test_node_builds_accuracy_view_without_monitoring_gt() -> None:
     result = main(
         pd.DataFrame([entry, exit_row]),
         _metric(),
-        traces_validation_result=_trace_quality(),
+        traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row])),
     )
 
     row = result["monitoring_umr"].iloc[0]
     assert row["input_query"] == "Вопрос"
     assert row["output_answer"] == "Финальный ответ"
     assert row["class"] == "domain-agent"
-    assert list(result["monitoring_umr"].columns) == [
-        "scenario",
-        "session_id",
-        "query_id",
-        "input_query_count",
-        "input_query",
-        "output_answer",
-        "class",
-    ]
+    assert row["definition_id"] == _metric()["definition_id"]
+    assert row["response_source_path"]
+    assert row["evaluation_ready"]
+
     assert "GT" not in result["monitoring_umr"]
     assert result["processing_report"]["status"] == "complete"
     assert result["processing_report"]["ready_for_scoring"] is True
@@ -216,20 +218,17 @@ def test_legacy_quality_only_validation_result_is_rejected() -> None:
         )
 
 
-def test_failed_dq_publishes_not_ready_without_reading_traces(
+def test_failed_dq_binds_source_without_extracting_turns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Красный DQ — вердикт 6.3.2, а не падение: трейсы не читаются, зависимые
-    тесты получают not_ready с причиной."""
+    def fail_on_extract(*args: object, **kwargs: object) -> None:
+        raise AssertionError("При красном DQ turn не извлекаются")
 
-    def fail_on_trace_read(*args: object, **kwargs: object) -> None:
-        raise AssertionError("Трейсы не должны читаться при красном DQ")
-
-    monkeypatch.setattr(converter, "read_table", fail_on_trace_read)
-    quality = _trace_quality()
+    monkeypatch.setattr(converter, "extract_turns", fail_on_extract)
+    frame = pd.DataFrame(_fipa_pair())
+    quality = _trace_quality(frame)
     quality["criteria"]["K2"]["tone"] = "bad"
-
-    result = main(object(), _metric(), traces_validation_result=quality)
+    result = main(frame, _metric(), traces_validation_result=quality)
 
     report = result["processing_report"]
     assert result["monitoring_umr"].empty
@@ -249,7 +248,7 @@ def test_empty_extraction_is_not_ready_with_counters() -> None:
     orphan["aef_kind"] = "chain"
     orphan["span_name"] = "Domain Agent Graph"
 
-    result = main(pd.DataFrame([orphan]), _metric(), traces_validation_result=_trace_quality())
+    result = main(pd.DataFrame([orphan]), _metric(), traces_validation_result=_trace_quality(pd.DataFrame([orphan])))
 
     report = result["processing_report"]
     assert result["monitoring_umr"].empty
@@ -264,13 +263,13 @@ def test_empty_extraction_is_not_ready_with_counters() -> None:
 def test_data_readiness_states() -> None:
     entry, exit_row = _fipa_pair()
     sufficient = main(
-        pd.DataFrame([entry, exit_row]), _metric(), traces_validation_result=_trace_quality()
+        pd.DataFrame([entry, exit_row]), _metric(), traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row]))
     )["processing_report"]["data_readiness"]
     assert sufficient["state"] == "sufficient" and sufficient["limits"] == []
     assert sufficient["unit"] == "turn" and sufficient["published_units"] == 1
     assert sufficient["extraction_coverage"] == 1.0 and sufficient["dq_status"] == "passed"
 
-    warned = _trace_quality()
+    warned = _trace_quality(pd.DataFrame([entry, exit_row]))
     warned["criteria"]["K3"]["tone"] = "warn"
     limited = main(
         pd.DataFrame([entry, exit_row]), _metric(), traces_validation_result=warned
@@ -288,7 +287,7 @@ def test_data_readiness_states() -> None:
     }}, ensure_ascii=False)
     partial = main(
         pd.DataFrame([entry, exit_row, malformed]), _metric(),
-        traces_validation_result=_trace_quality(), min_extraction_coverage=0.9,
+        traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row, malformed])), min_extraction_coverage=0.9,
     )["processing_report"]["data_readiness"]
     assert partial["state"] == "limited"
     assert partial["limits"] == ["partial_extraction", "low_extraction_coverage"]
@@ -301,7 +300,7 @@ def test_data_readiness_states() -> None:
 
 def test_min_extraction_coverage_is_validated_and_declared() -> None:
     with pytest.raises(ValueError, match="min_extraction_coverage"):
-        main(pd.DataFrame(), _metric(), traces_validation_result=_trace_quality(),
+        main(pd.DataFrame(), _metric(), traces_validation_result=_trace_quality(pd.DataFrame()),
              min_extraction_coverage=1.5)
     descriptor = json.loads((NODE_ROOT / "descriptor.json").read_text())
     settings = {
@@ -330,8 +329,8 @@ def test_all_assessors_metric_is_accepted() -> None:
 
     result = main(
         pd.DataFrame([entry, exit_row]),
-        metric,
-        traces_validation_result=_trace_quality(),
+        reviewed_metric(metric),
+        traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row])),
     )
 
     assert result["processing_report"]["ready_for_scoring"] is True
@@ -343,7 +342,7 @@ def test_control_characters_do_not_break_excel_export() -> None:
     result = main(
         pd.DataFrame([entry, exit_row]),
         _metric(),
-        traces_validation_result=_trace_quality(),
+        traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row])),
     )
 
     assert (
@@ -360,11 +359,13 @@ def test_excel_export_keeps_leading_equals_as_text() -> None:
     result = main(
         pd.DataFrame([entry, exit_row]),
         _metric(),
-        traces_validation_result=_trace_quality(),
+        traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row])),
     )
 
     workbook = result["umr_artifact"].book
-    cell = workbook[result["umr_artifact"].sheet_names[0]]["F2"]
+    sheet = workbook[result["umr_artifact"].sheet_names[0]]
+    column = next(cell.column for cell in sheet[1] if cell.value == "output_answer")
+    cell = sheet.cell(2, column)
     assert cell.value == '=HYPERLINK("https://example.test")'
     assert cell.data_type == "s"
 
@@ -378,7 +379,7 @@ def test_excel_export_truncates_cell_over_excel_limit() -> None:
     result = main(
         pd.DataFrame([entry, exit_row]),
         _metric(),
-        traces_validation_result=_trace_quality(),
+        traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row])),
     )
 
     assert len(result["monitoring_umr"].iloc[0]["output_answer"]) == 32_768
@@ -412,7 +413,7 @@ def test_incomplete_extraction_publishes_complete_turns() -> None:
     result = main(
         pd.DataFrame([entry, exit_row, malformed]),
         _metric(),
-        traces_validation_result=_trace_quality(),
+        traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row, malformed])),
     )
 
     assert result["processing_report"]["status"] == "partial"
@@ -426,7 +427,7 @@ def test_distributive_comes_from_selection() -> None:
     result = main(
         pd.DataFrame([entry, exit_row]),
         _metric(),
-        traces_validation_result=_trace_quality(),
+        traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row])),
         selection={
             "agent_ci": "CI00000001",
             "distributive": "https://nexus.example/repository/CI00000001/"
@@ -442,13 +443,13 @@ def test_distributive_comes_from_selection() -> None:
     assert "secret" not in artifact_path
 
 
-def test_solution_version_from_selection_is_published_in_flat_output() -> None:
+def test_verified_trace_solution_version_is_published_in_flat_output() -> None:
     entry, exit_row = _fipa_pair()
 
     result = main(
         pd.DataFrame([entry, exit_row]),
         _metric(),
-        traces_validation_result=_trace_quality(),
+        traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row])),
         selection={"solution_version": "D-01.002.03"},
     )
 
@@ -472,26 +473,24 @@ def test_dialogue_reports_published_turns_separately_from_rows() -> None:
     )
     metric = _metric()
     metric["assessment_mode"] = "dialogue"
+    metric = reviewed_metric(metric)
 
     result = main(
         pd.DataFrame([first_entry, first_exit, second_entry, second_exit]),
-        metric,
-        traces_validation_result=_trace_quality(),
+        reviewed_metric(metric),
+        traces_validation_result=_trace_quality(pd.DataFrame([first_entry, first_exit, second_entry, second_exit])),
         selection={"solution_version": "D-01.002.03"},
     )
 
     frame = result["monitoring_umr"]
-    assert list(frame.columns) == [
-        "solution_version", "scenario", "session_id", "dialogue", "class",
-    ]
-    assert frame["solution_version"].tolist() == ["D-01.002.03"]
-    assert ast.literal_eval(frame["dialogue"].iloc[0]) == [
-        ("conversation-1|request-1", "Вопрос", "Финальный ответ"),
-        ("conversation-1|request-2", "Второй вопрос", "Второй ответ"),
-    ]
+    assert frame["definition_id"].tolist() == [metric["definition_id"]] * 2
+    assert frame["response_source_path"].str.len().gt(0).all()
+
+    assert frame["solution_version"].tolist() == ["D-01.002.03", "D-01.002.03"]
+    assert frame["query_id"].tolist() == ["conversation-1|request-1", "conversation-1|request-2"]
+    assert frame["output_answer"].tolist() == ["Финальный ответ", "Второй ответ"]
     conservation = result["processing_report"]["conservation"]
-    assert conservation["published_turns"] == 2
-    assert conservation["published_rows"] == 1
+    assert conservation["published_turns"] == conservation["published_rows"] == 2
     assert conservation["unpublished_turns"] == 0
 
 
@@ -509,7 +508,7 @@ def test_qa_contract_keeps_repeated_session_as_flat_turns() -> None:
     result = main(
         pd.DataFrame([first_entry, first_exit, second_entry, second_exit]),
         _metric(),
-        traces_validation_result=_trace_quality(),
+        traces_validation_result=_trace_quality(pd.DataFrame([first_entry, first_exit, second_entry, second_exit])),
     )
 
     frame = result["monitoring_umr"]
@@ -534,7 +533,7 @@ def test_foreign_and_blank_agent_rows_are_counted() -> None:
     result = main(
         pd.DataFrame([entry, exit_row, foreign, blank]),
         _metric(),
-        traces_validation_result=_trace_quality(),
+        traces_validation_result=_trace_quality(pd.DataFrame([entry, exit_row, foreign, blank])),
         selection={"agent_ci": entry["agent_id"]},
     )
 
@@ -552,7 +551,7 @@ def test_not_computable_skips_traces_and_publishes_empty_artifacts(
 
     monkeypatch.setattr(converter, "read_table", fail_on_trace_read)
     metric = {
-        "contract_version": "laim-monitoring-metric.v2",
+        "contract_version": "laim-monitoring-metric.v3",
         "status": "not_computable",
         "reason_code": "official_baseline_missing",
         "reason": "Validation report не содержит официальный baseline",
@@ -562,14 +561,8 @@ def test_not_computable_skips_traces_and_publishes_empty_artifacts(
 
     frame = result["monitoring_umr"]
     assert frame.empty
-    assert list(frame.columns) == [
-        "scenario",
-        "session_id",
-        "query_id",
-        "input_query_count",
-        "input_query",
-        "output_answer",
-    ]
+    assert list(frame.columns) == ["scenario", "session_id", "query_id", "input_query_count", "input_query", "output_answer"]
+
     parquet = pd.read_parquet(BytesIO(result["parquet_test_dataset"]))
     assert parquet.empty and list(parquet.columns) == list(frame.columns)
     excel = pd.read_excel(result["umr_artifact"])
@@ -594,7 +587,7 @@ def test_monitoring_metric_rejects_unknown_status() -> None:
     metric = _metric()
     metric["status"] = "pending"
 
-    with pytest.raises(ValueError, match="computed или not_computable"):
+    with pytest.raises(ValueError, match="status"):
         main(object(), metric)
 
 
@@ -603,7 +596,7 @@ def test_monitoring_metric_rejects_unknown_status() -> None:
 @pytest.mark.parametrize("missing_field", ["reason_code", "reason"])
 def test_not_computable_requires_reason_fields(missing_field: str) -> None:
     metric = {
-        "contract_version": "laim-monitoring-metric.v2",
+        "contract_version": "laim-monitoring-metric.v3",
         "status": "not_computable",
         "reason_code": "official_baseline_missing",
         "reason": "Официальный baseline отсутствует",
@@ -614,3 +607,17 @@ def test_not_computable_requires_reason_fields(missing_field: str) -> None:
         main(object(), metric)
 
 
+
+
+@pytest.mark.parametrize("versions", [None, ["old-version", "old-version"],
+                                     ["D-01.002.03", "old-version"], [None, "D-01.002.03"]])
+def test_declared_version_cannot_relabel_unverified_or_old_traces(versions):
+    frame = pd.DataFrame(_fipa_pair())
+    if versions is None:
+        frame = frame.drop(columns="solution_version")
+    else:
+        frame["solution_version"] = versions
+    result = main(frame, _metric(), traces_validation_result=_trace_quality(frame),
+                  selection={"solution_version": "D-01.002.03"})
+    assert result["monitoring_umr"].empty
+    assert result["processing_report"]["reason_code"] == "source_version_unverified"

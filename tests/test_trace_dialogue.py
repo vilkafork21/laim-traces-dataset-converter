@@ -134,7 +134,7 @@ def _fipa_exit(
 def test_fipa_turn_is_joined_by_protocol_key_across_traces() -> None:
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), _fipa_exit()]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(route_source={'envelope': 'outgoing', 'field': 'receiver'}, observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert len(result.turns) == 1
@@ -153,7 +153,7 @@ def test_equivalent_fipa_replicas_are_deduplicated() -> None:
     replica = _fipa_entry(trace_id="trace-entry-copy", span_id="entry-copy")
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), replica, _fipa_exit()]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert len(result.turns) == 1
@@ -169,7 +169,7 @@ def test_conflicting_fipa_replicas_are_not_published() -> None:
     )
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), conflict, _fipa_exit()]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.empty
@@ -184,7 +184,7 @@ def test_incomplete_fipa_keys_are_reported_separately() -> None:
     orphan_exit["input_text"] = input_text.replace("conversation-1", "conversation-2")
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), orphan_exit]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.empty
@@ -206,7 +206,7 @@ def test_explicit_aef_boundary_pair_is_supported() -> None:
     )
     result = extract_turns(
         pd.DataFrame([row]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="aef_boundary_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns[["input_query", "agent_response"]].to_dict("records") == [
@@ -222,7 +222,7 @@ def test_explicit_aef_boundary_pair_is_supported() -> None:
     ("input_key", "output_key"),
     [("goal", "summary"), ("task", "error"), ("text", "summary")],
 )
-def test_start_agent_upstream_fallback_is_versioned(
+def test_internal_start_agent_is_not_a_delivery_boundary(
     input_key: str, output_key: str
 ) -> None:
     row = _span(
@@ -237,16 +237,14 @@ def test_start_agent_upstream_fallback_is_versioned(
 
     result = extract_turns(
         pd.DataFrame([row]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="aef_boundary_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
-    turn = result.turns.iloc[0]
-    assert turn["input_query"] == "Задача агента"
-    assert turn["agent_response"] == "Результат агента"
-    assert turn["schema_version"] == "aef_start_agent_v1"
+    assert result.turns.empty
+    assert result.report["complete_turns"] == 0
 
 
-def test_direct_parent_boundary_recovers_mismatched_fipa_key() -> None:
+def test_parent_does_not_repair_mismatched_fipa_key() -> None:
     parent = _span(
         trace_id="trace-parent",
         span_id="boundary",
@@ -289,21 +287,13 @@ def test_direct_parent_boundary_recovers_mismatched_fipa_key() -> None:
 
     result = extract_turns(
         pd.DataFrame([parent, start]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="aef_boundary_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
-    turn = result.turns.iloc[0]
-    assert turn["input_query"] == "Вопрос пользователя"
-    assert turn["agent_response"] == "Финальный ответ агента"
-    assert turn["route_label"] == "route"
-    assert turn["schema_version"] == "aef_parent_boundary_v1"
-    assert result.report["candidate_turn_keys"] == 1
-    assert result.report["complete_turns"] == 1
-    assert result.report["entry_without_exit"] == 0
-    assert result.report["exit_without_entry"] == 0
+    assert result.turns.empty
 
 
-def test_start_agent_echo_uses_unique_explicit_terminal_answer() -> None:
+def test_unrelated_terminal_answer_is_not_used() -> None:
     start = _span(
         trace_id="trace-terminal",
         span_id="agent",
@@ -327,16 +317,10 @@ def test_start_agent_echo_uses_unique_explicit_terminal_answer() -> None:
 
     result = extract_turns(
         pd.DataFrame([start, terminal]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="aef_boundary_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
-    turn = result.turns.iloc[0]
-    assert turn["input_query"] == "Вопрос пользователя"
-    assert turn["agent_response"] == "Финальный ответ"
-    assert turn["schema_version"] == "aef_semantic_terminal_v1"
-    assert result.report["candidate_turn_keys"] == 1
-    assert result.report["complete_turns"] == 1
-    assert result.report["incomplete_boundary_rows"] == 0
+    assert result.turns.empty
 
 
 def test_semantic_terminal_does_not_cross_session_boundary() -> None:
@@ -362,13 +346,10 @@ def test_semantic_terminal_does_not_cross_session_boundary() -> None:
 
     result = extract_turns(
         pd.DataFrame([start, terminal]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="aef_boundary_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.empty
-    assert result.report["complete_turns"] == 0
-    assert result.report["candidate_turn_keys"] == 1
-    assert result.report["incomplete_boundary_rows"] == 1
 
 
 def test_explicit_string_response_body_is_supported() -> None:
@@ -382,7 +363,7 @@ def test_explicit_string_response_body_is_supported() -> None:
 
     result = extract_turns(
         pd.DataFrame([row]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="aef_boundary_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.loc[0, "agent_response"] == "Финальный ответ агента"
@@ -409,7 +390,7 @@ def test_nested_start_agent_is_not_used_as_outer_response() -> None:
     )
     result = extract_turns(
         pd.DataFrame([outer, nested]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="aef_boundary_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.empty
@@ -428,7 +409,7 @@ def test_malformed_structured_payload_is_not_published_as_plain_text() -> None:
 
     result = extract_turns(
         pd.DataFrame([row]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="aef_boundary_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.empty
@@ -441,7 +422,7 @@ def test_session_mismatch_is_not_published() -> None:
 
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), exit_row]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.empty
@@ -461,7 +442,7 @@ def test_unknown_schema_is_visible_and_not_guessed() -> None:
     )
     result = extract_turns(
         pd.DataFrame([row]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="aef_boundary_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.empty
@@ -477,7 +458,7 @@ def test_missing_span_identity_fails_closed() -> None:
     with pytest.raises(TraceExtractionError, match="span_id"):
         extract_turns(
             pd.DataFrame([row]),
-            ExtractionConfig(agent_id="CI00000001"),
+            ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
         )
 
 
@@ -493,7 +474,7 @@ def test_multipart_answer_keeps_every_text_part_and_skips_widgets() -> None:
 
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), exit_row]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.iloc[0]["agent_response"] == (
@@ -512,7 +493,7 @@ def test_widget_first_answer_is_not_lost() -> None:
 
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), exit_row]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.iloc[0]["agent_response"] == "Текст после виджета"
@@ -529,7 +510,7 @@ def test_route_label_is_dispatched_label_when_dispatch_echoes_query() -> None:
 
     result = extract_turns(
         pd.DataFrame([entry, _fipa_exit()]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(route_source={'envelope': 'outgoing', 'field': 'message', 'part_index': 0}, observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     turn = result.turns.iloc[0]
@@ -538,10 +519,10 @@ def test_route_label_is_dispatched_label_when_dispatch_echoes_query() -> None:
     assert turn["agent_response"] == "Вот точный ответ агента."
 
 
-def test_route_label_falls_back_to_receiver_without_echo() -> None:
+def test_route_label_uses_explicit_receiver_source() -> None:
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), _fipa_exit()]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(route_source={'envelope': 'outgoing', 'field': 'receiver'}, observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     turn = result.turns.iloc[0]
@@ -593,7 +574,7 @@ def test_downstream_agent_turn_uses_requesting_agent_as_counterpart() -> None:
         answer="Кредит можно оформить в СберБанк Онлайн.",
     )
 
-    result = extract_turns(pd.DataFrame([row]), ExtractionConfig(agent_id="CI00000001"))
+    result = extract_turns(pd.DataFrame([row]), ExtractionConfig(route_source={'envelope': 'incoming', 'field': 'message', 'part_index': 0}, observation_profile="fipa_external_reply_v1", external_party="d-credit-helper", agent_id="CI00000001"))
 
     assert len(result.turns) == 1
     turn = result.turns.iloc[0]
@@ -630,7 +611,7 @@ def test_internal_inform_to_non_counterpart_is_not_an_orphan_exit() -> None:
 
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), internal, _fipa_exit()]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert len(result.turns) == 1
@@ -650,7 +631,7 @@ def test_trace_without_boundary_span_is_reported_separately() -> None:
 
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), _fipa_exit(), chain_only]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.report["no_boundary_trace_count"] == 1
@@ -710,7 +691,7 @@ def test_downstream_clarifying_request_does_not_make_it_a_counterpart() -> None:
 
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), inside, _fipa_exit(), clarify, relayed_answer]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.report["counterparts"] == ["agent_human"]
@@ -742,7 +723,7 @@ def test_agent_own_name_is_never_a_counterpart() -> None:
     )
 
     result = extract_turns(
-        pd.DataFrame([row, self_request]), ExtractionConfig(agent_id="CI00000001")
+        pd.DataFrame([row, self_request]), ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="d-credit-helper", agent_id="CI00000001")
     )
 
     assert result.report["counterparts"] == ["d-credit-helper"]
@@ -785,7 +766,7 @@ def test_state_json_exit_span_becomes_turn() -> None:
     """Агент со state_json (CI09840650): вопрос из messages, ответ из message_to_user."""
     result = extract_turns(
         pd.DataFrame([_state_json_span()]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="state_single_request_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert len(result.turns) == 1
@@ -799,7 +780,7 @@ def test_state_json_exit_span_becomes_turn() -> None:
 def test_state_json_without_product_agent_keeps_route_unknown() -> None:
     result = extract_turns(
         pd.DataFrame([_state_json_span(product_agent=None)]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="state_single_request_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert result.turns.iloc[0]["route_label"] == ""
@@ -823,7 +804,7 @@ def test_state_json_final_state_from_output_reconciles_incomplete_fipa() -> None
 
     result = extract_turns(
         pd.DataFrame([entry, root]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="state_single_request_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert len(result.turns) == 1
@@ -836,7 +817,7 @@ def test_state_json_final_state_from_output_reconciles_incomplete_fipa() -> None
     assert "entry_without_exit" not in set(result.issues["issue_code"])
 
 
-def test_state_json_output_echo_is_not_published_or_reconciled() -> None:
+def test_state_json_output_echo_is_preserved_for_assessment() -> None:
     root = _state_json_span()
     input_state = json.loads(str(root["input_text"]))
     input_state["stage"] = "scenarist"
@@ -855,31 +836,32 @@ def test_state_json_output_echo_is_not_published_or_reconciled() -> None:
 
     result = extract_turns(
         pd.DataFrame([entry, root]),
-        ExtractionConfig(agent_id="CI00000001"),
+        ExtractionConfig(observation_profile="state_single_request_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
-    assert result.turns.empty
-    assert result.report["candidate_turn_keys"] == 1
-    assert result.report["entry_without_exit"] == 1
-    assert "entry_without_exit" in set(result.issues["issue_code"])
+    assert result.turns.agent_response.tolist() == ["Подбери вклад"]
+    assert result.turns.input_query.tolist() == ["Подбери вклад"]
+    assert result.report["entry_without_exit"] == 0
 
 
-def test_state_json_keeps_only_last_exit_per_trace() -> None:
-    """Несколько exit-спанов одного trace — публикуется последний (финальное состояние)."""
+def test_distinct_state_exits_are_ambiguous() -> None:
+    """Различающиеся exit не доказывают, какой ответ был доставлен пользователю."""
     spans = pd.DataFrame([
         _state_json_span(span_id="early", answer="Черновик", start_time_ns=10),
         _state_json_span(span_id="late", answer="Финал", start_time_ns=20),
         _state_json_span(span_id="enter", stage="enter", start_time_ns=5),
     ])
 
-    result = extract_turns(spans, ExtractionConfig(agent_id="CI00000001"))
+    result = extract_turns(spans, ExtractionConfig(observation_profile="state_single_request_v1", external_party="agent_human", agent_id="CI00000001"))
 
-    assert len(result.turns) == 1
-    assert result.turns.iloc[0]["agent_response"] == "Финал"
+    assert result.turns.empty
+    assert result.report["state_json_candidate_turns"] == 1
+    assert result.report["state_json_ambiguous_traces"] == 1
+    assert result.report["state_json_session_missing"] == 0
 
 
 def test_state_json_does_not_shadow_fipa_turns() -> None:
-    """state_json дополняет только непокрытые трейсы, не дублируя fipa-turn'ы."""
+    """Утверждённый FIPA-профиль не переключается на state_json."""
     spans = pd.DataFrame([
         _fipa_entry(),
         _fipa_exit(),
@@ -887,7 +869,7 @@ def test_state_json_does_not_shadow_fipa_turns() -> None:
         _state_json_span(trace_id="trace-solo", span_id="state-solo", session_id="session-2"),
     ])
 
-    result = extract_turns(spans, ExtractionConfig(agent_id="CI00000001"))
+    result = extract_turns(spans, ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"))
 
-    families = sorted(result.turns["schema_family"].tolist())
-    assert families == ["fipa_acl", "state_json"]
+    assert result.turns["schema_family"].tolist() == ["fipa_acl"]
+    assert result.report["unsupported_trace_count"] + result.report["no_boundary_trace_count"] >= 1

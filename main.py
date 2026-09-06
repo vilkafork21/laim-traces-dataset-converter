@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from measurement import validate_measurement
+
 from collections import Counter
 from datetime import datetime
 from hashlib import sha256
@@ -15,6 +17,7 @@ from urllib.parse import urlsplit
 import pandas as pd
 
 from canonical import canonicalize_turns
+from dataset_identity import frame_identity
 from table_io import read_table
 from trace_dialogue import ExtractionConfig, extract_turns
 
@@ -65,6 +68,17 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
         )
     if not isinstance(value, dict):
         raise ValueError("traces_validation_result должен быть JSON object")
+    if value.get("contract_version") == "laim-traces-validation.v2":
+        schema = value.get("schema")
+        critical = schema.get("критичных нарушено") if isinstance(schema, dict) else None
+        if value.get("error") or (isinstance(critical, int) and not isinstance(critical, bool) and critical > 0):
+            return {"source": "laim-ars-env-validation.verdict", "scope": "K1-K6",
+                    "status": "not_computable" if value.get("error") else "failed",
+                    "source_dataset_id": value.get("source_dataset_id"),
+                    "contract_version": value.get("contract_version"),
+                    "counting_policy": value.get("counting_policy"),
+                    "non_gating_criteria": {},
+                    "reason": value.get("error") or "K1: критичные нарушения схемы исходной выгрузки"}
     required = {"schema", "quality", "criteria", "readiness", "metrics"}
     missing = sorted(required - set(value))
     if missing:
@@ -97,7 +111,7 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
             raise ValueError(
                 f"traces_validation_result.quality[0].{field} должен быть целым >= 0"
             )
-    if quality_item["rule_violations"] != (
+    if quality_item["rule_violations"] < (
         quality_item["blocking_rule_violations"]
         + quality_item["advisory_rule_violations"]
     ):
@@ -154,6 +168,9 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
         "warning_criteria": warnings,
         "non_gating_criteria": {code: criteria[code] for code in ("K7", "K8")},
         "readiness": readiness,
+        "source_dataset_id": value.get("source_dataset_id"),
+        "contract_version": value.get("contract_version"),
+        "counting_policy": value.get("counting_policy"),
     }
     if failed_checks:
         # Красный DQ — вердикт, а не падение ноды: данные периода непригодны,
@@ -170,8 +187,7 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
 def _validate_metric(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("monitoring_metric должен быть JSON object")
-    if value.get("contract_version") != "laim-monitoring-metric.v2":
-        raise ValueError("Ожидается laim-monitoring-metric.v2")
+    value = validate_measurement(value, require_computed=False)
     status = value.get("status")
     if status not in {"computed", "not_computable"}:
         raise ValueError(
@@ -395,6 +411,7 @@ def _not_ready_result(
     trace_check: dict[str, Any],
     minimum: float,
     extraction: dict[str, Any] | None = None,
+    source_dataset_id: str | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     assessment_mode = metric.get("assessment_mode") or "qa"
@@ -437,6 +454,8 @@ def _not_ready_result(
     )
     report: dict[str, Any] = {
         "contract_version": "laim-monitoring-trace-converter.v2",
+        "source_dataset_id": source_dataset_id,
+        "monitoring_dataset_id": frame_identity(monitoring_umr),
         "status": "not_ready",
         "agent_id": agent_id,
         "assessment_mode": assessment_mode,
@@ -502,11 +521,17 @@ def main(
             reason_code=metric["reason_code"], reason=metric["reason"],
             trace_check=_validate_trace_check(None, True), minimum=minimum,
         )
+    if requested_agent and requested_agent != metric["basket_id"]:
+        raise ValueError("selection.agent_ci не соответствует monitoring_metric.basket_id")
+    if solution_version and solution_version != metric["solution_version"]:
+        raise ValueError("selection.solution_version не соответствует утверждённому определению")
+    solution_version = metric["solution_version"]
+    requested_agent = metric["basket_id"]
     trace_check = _validate_trace_check(traces_validation_result, ignore_traces_checks)
-    if trace_check["status"] == "failed":
+    if trace_check["status"] == "not_computable":
         return _not_ready_result(
             metric, requested_agent, distributive, solution_version,
-            reason_code="dq_failed", reason=trace_check["reason"],
+            reason_code="dq_not_computable", reason=trace_check["reason"],
             trace_check=trace_check, minimum=minimum,
         )
 
@@ -514,6 +539,35 @@ def main(
     stage_started = perf_counter()
     spans = read_table(monitoring_traces, "monitoring_traces")
     read_seconds = perf_counter() - stage_started
+    source_dataset_id = spans.attrs["source_dataset_id"]
+    if not ignore_traces_checks and (
+        trace_check.get("contract_version") != "laim-traces-validation.v2"
+        or trace_check.get("counting_policy") != "attribute_cells_and_max_mandatory_v1"
+        or trace_check.get("source_dataset_id") != source_dataset_id
+    ):
+        return _not_ready_result(
+            metric, requested_agent, distributive, solution_version,
+            reason_code="dq_dataset_unverified",
+            reason="DQ v2 не удостоверяет содержимое фактически полученной выгрузки",
+            trace_check=trace_check, minimum=minimum, source_dataset_id=source_dataset_id,
+        )
+    if trace_check["status"] == "failed":
+        return _not_ready_result(
+            metric, requested_agent, distributive, solution_version,
+            reason_code="dq_failed", reason=trace_check["reason"],
+            trace_check=trace_check, minimum=minimum, source_dataset_id=source_dataset_id,
+        )
+    source_rows = spans
+    if "agent_id" in spans.columns:
+        source_rows = spans.loc[spans["agent_id"].astype(str).str.strip().eq(requested_agent)]
+    versions = source_rows.get("solution_version")
+    if versions is None or not versions.fillna("").eq(solution_version).all():
+        return _not_ready_result(
+            metric, requested_agent, distributive, solution_version,
+            reason_code="source_version_unverified",
+            reason="solution_version исходных spans отсутствует или не совпадает с определением КМ",
+            trace_check=trace_check, minimum=minimum, source_dataset_id=source_dataset_id,
+        )
     logger.info(
         "LAIM traces dataset converter: rows=%d, agent_id=%s, mode=%s",
         len(spans),
@@ -525,6 +579,9 @@ def main(
     extracted = extract_turns(
         spans,
         ExtractionConfig(
+            observation_profile=metric["evaluation"]["observation_profile"],
+            external_party=metric["evaluation"].get("external_party", ""),
+            route_source=metric["evaluation"].get("route_source"),
             agent_id=requested_agent, max_issue_examples=_MAX_ISSUE_EXAMPLES
         ),
     )
@@ -542,7 +599,7 @@ def main(
                 f"unsupported_trace_count={report['unsupported_trace_count']}, "
                 f"no_boundary_trace_count={report['no_boundary_trace_count']}"
             ),
-            trace_check=trace_check, minimum=minimum, extraction=report,
+            trace_check=trace_check, minimum=minimum, extraction=report, source_dataset_id=source_dataset_id,
         )
     unresolved_turns = (
         extracted.report["candidate_turn_keys"] - extracted.report["complete_turns"]
@@ -569,6 +626,10 @@ def main(
     )
     canonical_seconds = perf_counter() - stage_started
     monitoring_umr = canonical.result
+    if partial_source:
+        monitoring_umr["evaluation_ready"] = False
+        monitoring_umr["evaluation_reason"] = "Неполное извлечение: состав оцениваемой популяции не подтверждён"
+        canonical.report["ready_for_scoring"] = False
     if solution_version:
         monitoring_umr.insert(0, "solution_version", solution_version)
 
@@ -600,6 +661,8 @@ def main(
     settings = _output_settings(agent_id, distributive)
     processing_report = {
         "contract_version": "laim-monitoring-trace-converter.v2",
+        "source_dataset_id": source_dataset_id,
+        "monitoring_dataset_id": frame_identity(monitoring_umr),
         "status": status,
         "agent_id": agent_id,
         "assessment_mode": metric["assessment_mode"],
