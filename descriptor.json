@@ -101,7 +101,8 @@
         "table_io.py",
         "trace_dialogue.py",
         "canonical.py",
-        "measurement.py"
+        "measurement.py",
+        "dataset_identity.py"
       ],
       "functionName": "main",
       "functionParameters": [],

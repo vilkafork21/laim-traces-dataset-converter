@@ -348,7 +348,7 @@ def _row_record(row: tuple[object, ...], columns: list[str]) -> dict[str, object
     return dict(zip(columns, row, strict=True))
 
 
-def _candidate_mask(frame: pd.DataFrame) -> pd.Series:
+def candidate_mask(frame: pd.DataFrame) -> pd.Series:
     kinds = _string_series(frame["aef_kind"]).str.casefold()
     boundary = kinds.isin(_BOUNDARY_KINDS) | frame["span_name"].str.contains(
         _HTTP_BOUNDARY, na=False
@@ -596,9 +596,8 @@ def _filter_agent(
     return frame.loc[selected], agent_id, dropped
 
 
-def _parse_fipa_rows(candidates: pd.DataFrame, events: _FipaEvents) -> list[_FipaRow]:
+def _parse_fipa_rows(candidates: pd.DataFrame, events: _FipaEvents) -> Iterable[_FipaRow]:
     columns = list(candidates.columns)
-    rows: list[_FipaRow] = []
     for raw in candidates.itertuples(index=False, name=None):
         record = _row_record(raw, columns)
         incoming, incoming_path = _incoming_envelope(_mapping(record.get("input_text")))
@@ -610,20 +609,21 @@ def _parse_fipa_rows(candidates: pd.DataFrame, events: _FipaEvents) -> list[_Fip
             continue
         events.rows += 1
         events.traces.add(_identifier(record.get("trace_id")))
-        rows.append(_FipaRow(record, incoming, incoming_path, outgoing, outgoing_path))
-    return rows
+        yield _FipaRow(record, incoming, incoming_path, outgoing, outgoing_path)
 
 
 def _collect_fipa_events(candidates: pd.DataFrame, external_party: str) -> _FipaEvents:
     """Разложить кандидатов на входы/выходы контрагентов и non-FIPA записи."""
     events = _FipaEvents()
     rows = _parse_fipa_rows(candidates, events)
-    events.counterparts = {external_party: len({row.conversation_id for row in rows})} if external_party else {}
+    events.counterparts = {external_party: 0} if external_party else {}
+    conversations: set[str] = set()
     for row in rows:
         record = row.record
         trace_id = _identifier(record.get("trace_id"))
         span_id = _identifier(record.get("span_id"))
         conversation_id = row.conversation_id
+        conversations.add(conversation_id)
         base = {
             "session_id": _identifier(record.get("session_id")),
             "trace_id": trace_id,
@@ -687,6 +687,8 @@ def _collect_fipa_events(candidates: pd.DataFrame, external_party: str) -> _Fipa
                 events.failures_without_text += 1
             else:
                 events.malformed_exits += 1
+    if external_party:
+        events.counterparts[external_party] = len(conversations)
     return events
 
 
@@ -892,6 +894,18 @@ def _collect_aef_turns(
     return turns, incomplete
 
 
+def state_payload_mask(frame: pd.DataFrame) -> pd.Series:
+    inputs = frame["input_text"].astype(str)
+    outputs = frame["output_text"].astype(str)
+    return (
+        inputs.str.contains('"message_to_user"', regex=False)
+        & inputs.str.contains('"stage"', regex=False)
+    ) | (
+        outputs.str.contains('"message_to_user"', regex=False)
+        & outputs.str.contains('"stage"', regex=False)
+    )
+
+
 def _state_json_turns(
     frame: pd.DataFrame, covered_traces: set[str]
 ) -> tuple[list[dict[str, Any]], int, int]:
@@ -902,15 +916,7 @@ def _state_json_turns(
     """
     exits: dict[str, dict[str, Any]] = {}
     ambiguous: set[str] = set()
-    inputs = frame["input_text"].astype(str)
-    outputs = frame["output_text"].astype(str)
-    likely = (
-        inputs.str.contains('"message_to_user"', regex=False)
-        & inputs.str.contains('"stage"', regex=False)
-    ) | (
-        outputs.str.contains('"message_to_user"', regex=False)
-        & outputs.str.contains('"stage"', regex=False)
-    )
+    likely = state_payload_mask(frame)
     for record in frame.loc[likely].to_dict(orient="records"):
         trace_id = _identifier(record.get("trace_id"))
         if not trace_id or trace_id in covered_traces:
@@ -1011,7 +1017,7 @@ def extract_turns(
 
     frame, agent_id, dropped_rows = _filter_agent(spans, config.agent_id)
     trace_values = _string_series(frame["trace_id"])
-    candidates = frame.loc[_candidate_mask(frame)]
+    candidates = frame.loc[candidate_mask(frame)]
     issues: list[dict[str, str]] = []
 
     events = _FipaEvents()
