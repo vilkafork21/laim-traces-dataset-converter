@@ -26,6 +26,8 @@ def reviewed_metric(metric, **evaluation):
         "prediction_observable": "route_label" if metric["scoring"]["method"] == "accuracy" else None,
         "observation_profile": "fipa_external_reply_v1", "external_party": "agent_human", **evaluation,
     }
+    if metric["evaluation"]["observation_profile"] == "fipa_external_reply_v1":
+        metric["evaluation"].setdefault("route_source", {"envelope": "outgoing", "field": "receiver"})
     metric["definition_id"] = definition_id(metric)
     return approve_measurement(metric, {
         "decision": "approved", "definition_id": metric["definition_id"],

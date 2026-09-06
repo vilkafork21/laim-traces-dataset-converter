@@ -581,6 +581,7 @@ def main(
         ExtractionConfig(
             observation_profile=metric["evaluation"]["observation_profile"],
             external_party=metric["evaluation"].get("external_party", ""),
+            route_source=metric["evaluation"].get("route_source"),
             agent_id=requested_agent, max_issue_examples=_MAX_ISSUE_EXAMPLES
         ),
     )

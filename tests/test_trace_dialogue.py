@@ -134,7 +134,7 @@ def _fipa_exit(
 def test_fipa_turn_is_joined_by_protocol_key_across_traces() -> None:
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), _fipa_exit()]),
-        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
+        ExtractionConfig(route_source={'envelope': 'outgoing', 'field': 'receiver'}, observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     assert len(result.turns) == 1
@@ -510,7 +510,7 @@ def test_route_label_is_dispatched_label_when_dispatch_echoes_query() -> None:
 
     result = extract_turns(
         pd.DataFrame([entry, _fipa_exit()]),
-        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
+        ExtractionConfig(route_source={'envelope': 'outgoing', 'field': 'message', 'part_index': 0}, observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     turn = result.turns.iloc[0]
@@ -519,10 +519,10 @@ def test_route_label_is_dispatched_label_when_dispatch_echoes_query() -> None:
     assert turn["agent_response"] == "Вот точный ответ агента."
 
 
-def test_route_label_falls_back_to_receiver_without_echo() -> None:
+def test_route_label_uses_explicit_receiver_source() -> None:
     result = extract_turns(
         pd.DataFrame([_fipa_entry(), _fipa_exit()]),
-        ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
+        ExtractionConfig(route_source={'envelope': 'outgoing', 'field': 'receiver'}, observation_profile="fipa_external_reply_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
     turn = result.turns.iloc[0]
@@ -574,7 +574,7 @@ def test_downstream_agent_turn_uses_requesting_agent_as_counterpart() -> None:
         answer="Кредит можно оформить в СберБанк Онлайн.",
     )
 
-    result = extract_turns(pd.DataFrame([row]), ExtractionConfig(observation_profile="fipa_external_reply_v1", external_party="d-credit-helper", agent_id="CI00000001"))
+    result = extract_turns(pd.DataFrame([row]), ExtractionConfig(route_source={'envelope': 'incoming', 'field': 'message', 'part_index': 0}, observation_profile="fipa_external_reply_v1", external_party="d-credit-helper", agent_id="CI00000001"))
 
     assert len(result.turns) == 1
     turn = result.turns.iloc[0]
@@ -817,7 +817,7 @@ def test_state_json_final_state_from_output_reconciles_incomplete_fipa() -> None
     assert "entry_without_exit" not in set(result.issues["issue_code"])
 
 
-def test_state_json_output_echo_is_not_published_or_reconciled() -> None:
+def test_state_json_output_echo_is_preserved_for_assessment() -> None:
     root = _state_json_span()
     input_state = json.loads(str(root["input_text"]))
     input_state["stage"] = "scenarist"
@@ -839,7 +839,8 @@ def test_state_json_output_echo_is_not_published_or_reconciled() -> None:
         ExtractionConfig(observation_profile="state_single_request_v1", external_party="agent_human", agent_id="CI00000001"),
     )
 
-    assert result.turns.empty
+    assert result.turns.agent_response.tolist() == ["Подбери вклад"]
+    assert result.turns.input_query.tolist() == ["Подбери вклад"]
     assert result.report["entry_without_exit"] == 0
 
 

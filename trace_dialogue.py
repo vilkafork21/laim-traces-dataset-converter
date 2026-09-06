@@ -31,9 +31,6 @@ _HTTP_BOUNDARY = re.compile(
     r"^(?:get|post|put|patch|delete)\s+\S+|(?:^|[./])invoke$", re.I
 )
 _FIPA_MARKER = re.compile(r"[\"'](?:conversation_id|reply_with|in_reply_to)[\"']")
-# Метка маршрута/класса в content.message: короткий токен без пробелов.
-_LABEL_TOKEN = re.compile(r"^[\w.:-]{1,64}$")
-_TECHNICAL_ACKS = {"ok", "success", "done", "accepted", "processing", "true", "false"}
 _MESSAGE_PART_SEPARATOR = "\n\n"
 _TERMINAL_ANSWER_KEYS = (
     "final_response",
@@ -91,8 +88,20 @@ class ExtractionConfig:
     external_party: str = ""
     agent_id: str = ""
     max_issue_examples: int = 100
+    route_source: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
+        source = self.route_source
+        if source is not None:
+            if not isinstance(source, dict):
+                raise TraceExtractionError("route_source должен быть объектом")
+            receiver = source == {"envelope": "outgoing", "field": "receiver"}
+            message = (set(source) == {"envelope", "field", "part_index"}
+                       and source["envelope"] in ("incoming", "outgoing")
+                       and source["field"] == "message"
+                       and type(source["part_index"]) is int and source["part_index"] >= 0)
+            if not (receiver or message) or self.observation_profile != "fipa_external_reply_v1":
+                raise TraceExtractionError(f"Неподдерживаемый route_source: {source!r}")
         if self.observation_profile not in ("fipa_external_reply_v1", "aef_boundary_v1", "state_single_request_v1"):
             raise TraceExtractionError(f"Неизвестный observation_profile: {self.observation_profile!r}")
         if self.observation_profile == "fipa_external_reply_v1" and not self.external_party.strip():
@@ -211,10 +220,6 @@ def _text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _semantic(value: object) -> str:
-    return re.sub(r"\s+", " ", _identifier(value)).casefold()
-
-
 def _string_series(values: pd.Series) -> pd.Series:
     return values.astype("string").fillna("").str.strip()
 
@@ -297,50 +302,24 @@ def _is_request(envelope: dict[str, Any] | None) -> bool:
 
 
 def _is_reply(envelope: dict[str, Any] | None) -> bool:
-    """FIPA-ответ (inform/failure/…): не request и с in_reply_to."""
+    """Завершающее сообщение FIPA request; agree ещё не является результатом."""
     if envelope is None:
         return False
     performative = _identifier(envelope.get("performative")).casefold()
-    return performative != "request" and bool(_identifier(envelope.get("in_reply_to")))
+    return performative in {"inform", "failure", "refuse", "not-understood"} and bool(_identifier(envelope.get("in_reply_to")))
 
 
-def _split_label(
-    parts: list[tuple[int, str]],
-) -> tuple[str, int, list[tuple[int, str]]]:
-    """Отделить метку вида [label, текст...] от текста; метка — токен без пробелов."""
-    if (
-        len(parts) >= 2
-        and _LABEL_TOKEN.match(parts[0][1])
-        and not _LABEL_TOKEN.match(parts[-1][1])
-    ):
-        index, label = parts[0]
-        return label, index, parts[1:]
-    return "", -1, parts
-
-
-def _route_label(
-    outgoing: dict[str, Any] | None,
-    outgoing_path: str,
-    query: str,
-    counterparts: dict[str, int],
-) -> tuple[str, str]:
-    """Наблюдаемое решение маршрутизации на исходящем событии входа.
-
-    Роутер вида [label, echo вопроса] в content.message кладёт метку класса
-    в текстовую часть, а receiver у него постоянный. Без такого эха меткой
-    остаётся receiver, если это не контрагент-инициатор.
-    """
-    if outgoing is None:
+def _route_label(row: _FipaRow, source: dict[str, object] | None) -> tuple[str, str]:
+    if source is None:
         return "", ""
-    parts = _message_parts(outgoing)
-    query_key = _semantic(query)
-    if len(parts) >= 2 and any(_semantic(text) == query_key for _, text in parts):
-        for index, text in parts:
-            if _semantic(text) != query_key:
-                return text, f"{outgoing_path}.content.message[{index}].value"
-    receiver = _identifier(outgoing.get("receiver"))
-    if receiver and receiver not in counterparts:
-        return receiver, f"{outgoing_path}.receiver"
+    envelope = row.incoming if source["envelope"] == "incoming" else row.outgoing
+    path = row.incoming_path if source["envelope"] == "incoming" else row.outgoing_path
+    if source["field"] == "receiver":
+        return _identifier((envelope or {}).get("receiver")), f"{path}.receiver"
+    index = source["part_index"]
+    for position, text in _message_parts(envelope):
+        if position == index:
+            return text, f"{path}.content.message[{index}].value"
     return "", ""
 
 
@@ -376,9 +355,8 @@ def _replica_values(
     values: dict[str, object] = {}
     for candidate in candidates:
         value = candidate.get(field_name)
-        key = _semantic(value)
-        if key:
-            values.setdefault(key, value)
+        key = _identifier(value)
+        values.setdefault(key, value)
     return values
 
 
@@ -398,10 +376,6 @@ def _merge_replicas(
     selected = dict(
         sorted(candidates, key=lambda item: _ordered(item, latest=latest))[0]
     )
-    for field_name in fields:
-        values = _replica_values(candidates, field_name)
-        if values:
-            selected[field_name] = next(iter(values.values()))
     selected["replica_count"] = len(candidates)
     return selected, []
 
@@ -486,7 +460,7 @@ def _response_text(value: object) -> tuple[str, str]:
         text = parsed.strip()
         if text[:1] in "[{":
             return "", ""
-        if text and _semantic(text) not in _TECHNICAL_ACKS:
+        if text:
             return text, "output_text"
         return "", ""
     if not isinstance(parsed, dict):
@@ -512,7 +486,7 @@ def _response_text(value: object) -> tuple[str, str]:
             if text:
                 return text, f"output_text.body.{key}"
     direct_body = _text(parsed.get("body"))
-    if direct_body and _semantic(direct_body) not in _TECHNICAL_ACKS:
+    if direct_body:
         return direct_body, "output_text.body"
     response = _mapping(parsed.get("response"))
     if response is not None:
@@ -524,10 +498,7 @@ def _response_text(value: object) -> tuple[str, str]:
                 suffix = f"body.{key}" if response_body is not response else key
                 return text, f"output_text.response.{suffix}"
         direct_response_body = _text(raw_response_body)
-        if (
-            direct_response_body
-            and _semantic(direct_response_body) not in _TECHNICAL_ACKS
-        ):
+        if direct_response_body:
             return direct_response_body, "output_text.response.body"
     return "", ""
 
@@ -536,7 +507,7 @@ def _aef_turn(record: dict[str, object]) -> dict[str, Any] | None:
     query, query_path = _request_text(record.get("input_text"))
     response, response_path = _response_text(record.get("output_text"))
     schema_version = AEF_BOUNDARY_SCHEMA
-    if not query or not response or _semantic(query) == _semantic(response):
+    if not query or not response:
         return None
     trace_id = _identifier(record.get("trace_id"))
     span_id = _identifier(record.get("span_id"))
@@ -612,7 +583,7 @@ def _parse_fipa_rows(candidates: pd.DataFrame, events: _FipaEvents) -> Iterable[
         yield _FipaRow(record, incoming, incoming_path, outgoing, outgoing_path)
 
 
-def _collect_fipa_events(candidates: pd.DataFrame, external_party: str) -> _FipaEvents:
+def _collect_fipa_events(candidates: pd.DataFrame, external_party: str, route_source: dict[str, object] | None = None) -> _FipaEvents:
     """Разложить кандидатов на входы/выходы контрагентов и non-FIPA записи."""
     events = _FipaEvents()
     rows = _parse_fipa_rows(candidates, events)
@@ -637,18 +608,13 @@ def _collect_fipa_events(candidates: pd.DataFrame, external_party: str) -> _Fipa
             and _identifier(incoming.get("sender")) in events.counterparts
         ):
             request_id = _identifier(incoming.get("reply_with"))
-            label, label_index, query_parts = _split_label(_message_parts(row.incoming))
+            query_parts = _message_parts(row.incoming)
+            route, route_path = _route_label(row, route_source)
+            if route_source and route_source["envelope"] == "incoming" and route_source["field"] == "message":
+                query_parts = [(i, text) for i, text in query_parts if i != route_source["part_index"]]
             query = _message_text(query_parts)
+            conversation_id = _identifier(incoming.get("conversation_id"))
             if conversation_id and request_id and query and trace_id and span_id:
-                if label:
-                    route, route_path = (
-                        label,
-                        f"{row.incoming_path}.content.message[{label_index}].value",
-                    )
-                else:
-                    route, route_path = _route_label(
-                        row.outgoing, row.outgoing_path, query, events.counterparts
-                    )
                 events.entries[(conversation_id, request_id)].append(
                     {
                         **base,
@@ -663,10 +629,16 @@ def _collect_fipa_events(candidates: pd.DataFrame, external_party: str) -> _Fipa
                 )
             else:
                 events.malformed_entries += 1
+        if (_identifier(outgoing.get("receiver")) in events.counterparts
+                and outgoing.get("in_reply_to")
+                and not _is_reply(row.outgoing)
+                and _identifier(outgoing.get("performative")).casefold() != "agree"):
+            events.malformed_exits += 1
         if (
             _is_reply(row.outgoing)
             and _identifier(outgoing.get("receiver")) in events.counterparts
         ):
+            conversation_id = _identifier(outgoing.get("conversation_id")) or row.conversation_id
             request_id = _identifier(outgoing.get("in_reply_to"))
             response = _message_text(_message_parts(row.outgoing))
             if conversation_id and request_id and response and trace_id and span_id:
@@ -706,7 +678,7 @@ def _join_fipa_turns(
         if key in events.entries:
             entry, entry_conflicts = _merge_replicas(
                 events.entries[key],
-                ("input_query", "route_label", "downstream_request_id"),
+                ("input_query", "route_label", "downstream_request_id", "session_id"),
                 latest=False,
             )
         exit_event: dict[str, Any] | None = None
@@ -714,7 +686,7 @@ def _join_fipa_turns(
         if key in events.exits:
             exit_event, exit_conflicts = _merge_replicas(
                 events.exits[key],
-                ("agent_response", "returned_downstream_request_id"),
+                ("agent_response", "returned_downstream_request_id", "session_id"),
                 latest=True,
             )
         if entry_conflicts:
@@ -908,7 +880,7 @@ def state_payload_mask(frame: pd.DataFrame) -> pd.Series:
 
 def _state_json_turns(
     frame: pd.DataFrame, covered_traces: set[str]
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int, int]:
     """Turn'ы langgraph-агентов: диалог лежит в state_json внутри input_text.
 
     Профиль допускает ровно один логический запрос на trace. Различающиеся
@@ -916,8 +888,10 @@ def _state_json_turns(
     """
     exits: dict[str, dict[str, Any]] = {}
     ambiguous: set[str] = set()
+    incomplete: set[str] = set()
     likely = state_payload_mask(frame)
-    for record in frame.loc[likely].to_dict(orient="records"):
+    records = frame.loc[likely].to_dict(orient="records")
+    for record in sorted(records, key=lambda r: (_integer(r.get("start_time_ns")) or 0, _identifier(r.get("span_id")))):
         trace_id = _identifier(record.get("trace_id"))
         if not trace_id or trace_id in covered_traces:
             continue
@@ -936,9 +910,10 @@ def _state_json_turns(
             continue
         answer = _text(state.get("message_to_user"))
         query = _typed_message(state, {"user", "human"})
-        if not answer or not query or _semantic(answer) == _semantic(query):
+        time_ns = _integer(record.get("start_time_ns"))
+        if not answer or not query or time_ns is None or not _identifier(record.get("span_id")):
+            incomplete.add(trace_id)
             continue
-        time_ns = _integer(record.get("start_time_ns")) or 0
         current = exits.get(trace_id)
         route = _text(state.get("product_agent"))
         if current is not None:
@@ -971,7 +946,7 @@ def _state_json_turns(
         }
     turns = [turn for trace, turn in exits.items() if trace not in ambiguous]
     missing_sessions = sum(not turn["session_id"] for turn in turns)
-    return [turn for turn in turns if turn["session_id"]], missing_sessions, len(ambiguous)
+    return [turn for turn in turns if turn["session_id"]], missing_sessions, len(ambiguous), len(incomplete - exits.keys())
 
 
 def _ordered_turns(turns: list[dict[str, Any]]) -> pd.DataFrame:
@@ -1026,13 +1001,14 @@ def extract_turns(
     state_turns = []
     state_session_missing = 0
     state_ambiguous_traces = 0
+    state_incomplete_traces = 0
     incomplete_boundaries = 0
     fipa_keys = 0
     fipa_stats = {key: 0 for key in (
         "entry_without_exit", "exit_without_entry", "conflicting_entry_keys",
         "conflicting_exit_keys", "cross_trace_turns", "session_mismatches", "route_chain_complete_turns")}
     if config.observation_profile == "fipa_external_reply_v1":
-        events = _collect_fipa_events(candidates, config.external_party)
+        events = _collect_fipa_events(candidates, config.external_party, config.route_source)
         fipa_keys = len(set(events.entries) | set(events.exits))
         fipa_turns, fipa_stats = _join_fipa_turns(events, issues)
     elif config.observation_profile == "aef_boundary_v1":
@@ -1040,7 +1016,7 @@ def extract_turns(
         events = _collect_fipa_events(boundaries, "")
         aef_turns, incomplete_boundaries = _collect_aef_turns(events, issues)
     else:
-        state_turns, state_session_missing, state_ambiguous_traces = _state_json_turns(frame, set())
+        state_turns, state_session_missing, state_ambiguous_traces, state_incomplete_traces = _state_json_turns(frame, set())
     state_traces = {turn["entry_trace_id"] for turn in state_turns}
 
     candidate_traces = set(_string_series(candidates["trace_id"]))
@@ -1078,6 +1054,7 @@ def extract_turns(
         + len(state_turns)
         + state_session_missing
         + state_ambiguous_traces
+        + state_incomplete_traces
     )
     complete_turns = len(turns)
     report = {
@@ -1094,10 +1071,11 @@ def extract_turns(
         "fipa_extraction_coverage": len(fipa_turns) / fipa_keys if fipa_keys else 0.0,
         "aef_candidate_boundaries": int(len(aef_turns) + incomplete_boundaries),
         "aef_complete_turns": int(len(aef_turns)),
-        "state_json_candidate_turns": int(len(state_turns) + state_session_missing + state_ambiguous_traces),
+        "state_json_candidate_turns": int(len(state_turns) + state_session_missing + state_ambiguous_traces + state_incomplete_traces),
         "state_json_complete_turns": int(len(state_turns)),
         "state_json_session_missing": int(state_session_missing),
         "state_json_ambiguous_traces": int(state_ambiguous_traces),
+        "state_json_incomplete_traces": int(state_incomplete_traces),
         "candidate_turn_keys": int(candidate_turn_keys),
         "complete_turns": int(complete_turns),
         "extraction_coverage": (

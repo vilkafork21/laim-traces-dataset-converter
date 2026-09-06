@@ -147,6 +147,7 @@ def _fipa_pair(
             "outgoing": {
                 "receiver": "agent_human",
                 "in_reply_to": request_id,
+                "performative": "inform",
                 "content": {"message": [{"type": "text", "value": answer}]},
             }
         },
