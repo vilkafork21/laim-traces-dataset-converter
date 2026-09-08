@@ -100,6 +100,8 @@
         "main.py",
         "table_io.py",
         "trace_dialogue.py",
+        "bodies.py",
+        "fipa.py",
         "canonical.py"
       ],
       "functionName": "main",

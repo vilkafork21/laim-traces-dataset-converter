@@ -311,14 +311,12 @@ def _excel(
     return pd.ExcelFile(buffer), truncated
 
 
-def _issue_summary(issues: pd.DataFrame) -> dict[str, Any]:
-    if issues.empty:
-        return {"counts": {}, "examples": [], "examples_truncated": False}
-    counts = Counter(issues["issue_code"].astype(str))
+def _issue_summary(issues: pd.DataFrame | None, report: dict[str, Any]) -> dict[str, Any]:
+    examples = issues.head(_MAX_ISSUE_EXAMPLES).to_dict("records") if issues is not None else []
     return {
-        "counts": dict(sorted(counts.items())),
-        "examples": issues.head(_MAX_ISSUE_EXAMPLES).to_dict(orient="records"),
-        "examples_truncated": len(issues) > _MAX_ISSUE_EXAMPLES,
+        "counts": report["issue_counts"],
+        "examples": examples,
+        "examples_truncated": report["issue_rows"] > len(examples),
     }
 
 
@@ -395,6 +393,7 @@ def _not_ready_result(
     trace_check: dict[str, Any],
     minimum: float,
     extraction: dict[str, Any] | None = None,
+    issues: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     assessment_mode = metric.get("assessment_mode") or "qa"
@@ -464,6 +463,7 @@ def _not_ready_result(
     }
     if extraction is not None:
         report["extraction"] = extraction
+        report["issues"] = _issue_summary(issues, extraction)
     return {
         "monitoring_umr": monitoring_umr,
         "processing_report": report,
@@ -542,7 +542,7 @@ def main(
                 f"unsupported_trace_count={report['unsupported_trace_count']}, "
                 f"no_boundary_trace_count={report['no_boundary_trace_count']}"
             ),
-            trace_check=trace_check, minimum=minimum, extraction=report,
+            trace_check=trace_check, minimum=minimum, extraction=report, issues=extracted.issues,
         )
     unresolved_turns = (
         extracted.report["candidate_turn_keys"] - extracted.report["complete_turns"]
@@ -550,6 +550,10 @@ def main(
     partial_source = bool(
         unresolved_turns
         or extracted.report["unsupported_trace_count"]
+        or extracted.report["no_boundary_trace_count"]
+        or extracted.report["invalid_span_rows"]
+        or extracted.report["conflicting_span_rows"]
+        or extracted.report["issue_counts"].get("session_id_partial")
         or extracted.report["conflicting_entry_keys"]
         or extracted.report["conflicting_exit_keys"]
     )
@@ -579,8 +583,11 @@ def main(
     total_seconds = perf_counter() - started
 
     agent_id = extracted.report["agent_id"]
-    ready = canonical.report["ready_for_scoring"]
-    status = "partial" if partial_source else ("complete" if ready else "not_ready")
+    ready = canonical.report["ready_for_scoring"] and not partial_source
+    status = (
+        "not_ready" if not canonical.report["ready_for_scoring"]
+        else "partial" if partial_source else "complete"
+    )
     warnings = []
     if canonical.report["missing_scoring_sources"]:
         warnings.append(
@@ -632,7 +639,7 @@ def main(
             "extraction_coverage": extracted.report["extraction_coverage"],
         },
         "extraction": extracted.report,
-        "issues": _issue_summary(extracted.issues),
+        "issues": _issue_summary(extracted.issues, extracted.report),
         "semantic_profile": canonical.filter_report,
         "canonicalization": canonical.report,
         "serialization": {"excel_truncated_cells": excel_truncated},

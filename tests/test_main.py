@@ -109,6 +109,7 @@ def _fipa_pair(
         f"entry{trace_suffix}",
         {
             "message": {
+                "performative": "request",
                 "sender": "agent_human",
                 "receiver": "orchestrator",
                 "conversation_id": "conversation-1",
@@ -118,6 +119,7 @@ def _fipa_pair(
         },
         {
             "outgoing": {
+                "performative": "request",
                 "receiver": "domain-agent",
                 "reply_with": domain_request_id,
                 "content": {"message": [{"type": "text", "value": "dispatch"}]},
@@ -130,6 +132,7 @@ def _fipa_pair(
         f"exit{trace_suffix}",
         {
             "message": {
+                "performative": "inform",
                 "sender": "domain-agent",
                 "receiver": "orchestrator",
                 "conversation_id": "conversation-1",
@@ -139,6 +142,7 @@ def _fipa_pair(
         },
         {
             "outgoing": {
+                "performative": "inform",
                 "receiver": "agent_human",
                 "in_reply_to": request_id,
                 "content": {"message": [{"type": "text", "value": answer}]},
@@ -416,8 +420,22 @@ def test_incomplete_extraction_publishes_complete_turns() -> None:
     )
 
     assert result["processing_report"]["status"] == "partial"
+    assert result["processing_report"]["ready_for_scoring"] is False
     assert result["processing_report"]["conservation"]["published_turns"] == 1
     assert result["processing_report"]["conservation"]["unpublished_turns"] == 1
+
+
+def test_missing_scoring_source_takes_precedence_over_partial_extraction() -> None:
+    rows = [
+        _span("t", "complete", {"query": "Вопрос"}, {"answer": "Ответ"}, 10),
+        _span("t", "incomplete", {"query": "Другой вопрос"}, {}, 20),
+    ]
+    report = main(pd.DataFrame(rows), _metric(), traces_validation_result=_trace_quality())["processing_report"]
+    assert report["canonicalization"]["missing_scoring_sources"] == ["class"]
+    assert report["status"] == "not_ready"
+    assert report["ready_for_scoring"] is False
+    assert report["conservation"]["published_turns"] == 1
+    assert report["conservation"]["unpublished_turns"] == 1
 
 
 def test_distributive_comes_from_selection() -> None:
@@ -612,5 +630,4 @@ def test_not_computable_requires_reason_fields(missing_field: str) -> None:
 
     with pytest.raises(ValueError, match=missing_field):
         main(object(), metric)
-
 
