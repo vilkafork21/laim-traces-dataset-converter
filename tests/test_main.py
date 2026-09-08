@@ -184,6 +184,30 @@ def test_node_builds_accuracy_view_without_monitoring_gt() -> None:
     assert trace_gate["non_gating_criteria"]["K8"]["tone"] == "bad"
 
 
+def test_muted_k8_is_preserved_as_non_gating_diagnostics() -> None:
+    quality = _trace_quality()
+    quality["criteria"]["K8"]["tone"] = "muted"
+    quality["criteria"]["K8"]["result"] = "умеренно"
+    result = main(pd.DataFrame(_fipa_pair()), _metric(), traces_validation_result=quality)
+    report = result["processing_report"]
+    assert len(result["monitoring_umr"]) == 1
+    assert report["status"] == "complete"
+    assert (
+        report["traces_validation"]["non_gating_criteria"]["K8"]
+        == quality["criteria"]["K8"]
+    )
+
+
+@pytest.mark.parametrize(
+    "code,tone", [(f"K{i}", "muted") for i in range(1, 8)] + [("K8", "unknown")]
+)
+def test_invalid_criterion_tone_is_rejected(code: str, tone: str) -> None:
+    quality = _trace_quality()
+    quality["criteria"][code]["tone"] = tone
+    with pytest.raises(ValueError, match=f"criteria.{code} некорректен"):
+        main(object(), _metric(), traces_validation_result=quality)
+
+
 def test_trace_quality_result_is_required_by_default() -> None:
     with pytest.raises(ValueError, match="traces_validation_result не передан"):
         main(pd.DataFrame(), _metric())

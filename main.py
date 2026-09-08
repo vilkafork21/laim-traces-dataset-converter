@@ -115,9 +115,12 @@ def _validate_trace_check(value: object, ignore: bool) -> dict[str, Any]:
         raise ValueError("traces_validation_result.criteria должен содержать K1–K8")
     for code in sorted(expected_criteria):
         criterion = criteria[code]
+        allowed_tones = {"good", "warn", "bad"}
+        if code == "K8":
+            allowed_tones.add("muted")
         if (
             not isinstance(criterion, dict)
-            or criterion.get("tone") not in {"good", "warn", "bad"}
+            or criterion.get("tone") not in allowed_tones
             or not _clean_text(criterion.get("result"))
             or not _clean_text(criterion.get("title"))
         ):
