@@ -54,6 +54,7 @@ class Projection:
     path: str = ""
     candidates: tuple[Leaf, ...] = ()
     source: str = ""
+    candidates_complete: bool = True
 
 
 def parse_body(raw: object) -> object:
@@ -139,6 +140,7 @@ def message_parts(envelope: dict) -> list[tuple[int, str]]:
 
 
 def _choose(projections: list[Projection]) -> Projection:
+    candidates_complete = all(item.candidates_complete for item in projections)
     for source in ("envelope", "message"):
         structured = [item for item in projections if item.source == source]
         if structured:
@@ -155,12 +157,18 @@ def _choose(projections: list[Projection]) -> Projection:
     )
     # Равные значения в разных полях не доказывают, какое поле является ответом.
     if len(leaves) > 1 or any(item.status == "ambiguous" for item in projections):
-        return Projection("ambiguous", candidates=leaves, source=projections[0].source)
+        return Projection(
+            "ambiguous", candidates=leaves, source=projections[0].source,
+            candidates_complete=candidates_complete,
+        )
     source = projections[0].source if projections else ""
     return (
-        Projection("text", leaves[0].text, leaves[0].path, source=source)
+        Projection(
+            "text", leaves[0].text, leaves[0].path, source=source,
+            candidates_complete=candidates_complete,
+        )
         if leaves
-        else Projection("empty", source=source)
+        else Projection("empty", source=source, candidates_complete=candidates_complete)
     )
 
 
@@ -270,7 +278,7 @@ def _project(value: object, path: str, side: str, depth: int) -> Projection:
         roles = [_role(item) for item in value]
         if any(roles):
             if not all(roles):
-                return Projection("ambiguous")
+                return Projection("ambiguous", candidates_complete=False)
             # Пустое последнее assistant-сообщение с tool_calls не заменяется предыдущим ответом.
             for index in range(len(value) - 1, -1, -1):
                 if roles[index] == side:

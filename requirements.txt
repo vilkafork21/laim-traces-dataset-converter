@@ -1,3 +1,4 @@
 pandas>=2.2,<3.0
 pyarrow>=15,<24
 openpyxl>=3.1,<4.0
+httpx>=0.28,<0.29

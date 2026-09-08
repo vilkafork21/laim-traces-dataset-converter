@@ -20,6 +20,7 @@ import pandas as pd
 import fipa
 from bodies import MALFORMED, Leaf, Projection, envelopes, parse_body, project_body
 from fipa import FIPA_SCHEMA, ISSUE_COLUMNS, issue
+from shadow_extraction import ShadowCollector
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,7 @@ class _Pair:
     query: Projection
     answer: Projection
     query_prefix: str
+    request_body: object
 
 
 def _identifier(value: object) -> str:
@@ -363,7 +365,7 @@ def _pair(span: ParsedSpan, source: ParsedSpan) -> _Pair:
     prefix = "" if source is span else f"descendant:{source.span_id}:"
     query = project_body(source.request, side="request")
     answer = project_body(span.response, side="response")
-    return _Pair(span, query, answer, prefix)
+    return _Pair(span, query, answer, prefix, source.request)
 
 
 def _pair_failure(pair: _Pair) -> str:
@@ -519,7 +521,9 @@ def _unique_spans(
     return frame.drop(index=rejected), counts
 
 
-def extract_turns(spans: pd.DataFrame, config: ExtractionConfig) -> ExtractionResult:
+def extract_turns(
+    spans: pd.DataFrame, config: ExtractionConfig, *, shadow: ShadowCollector | None = None,
+) -> ExtractionResult:
     """Извлечь внешние обращения; неоднозначные и неполные события оставить в диагностике."""
     if not isinstance(spans, pd.DataFrame):
         raise TraceExtractionError("spans должен быть pandas.DataFrame")
@@ -647,8 +651,27 @@ def extract_turns(spans: pd.DataFrame, config: ExtractionConfig) -> ExtractionRe
                 inner_rows += 1
 
     counterparts = fipa.derive_counterparts(fipa_spans)
-    events = fipa.collect_events(fipa_spans, counterparts, issues)
+    shadow_events = fipa.Events() if shadow is not None else None
+    events = fipa.collect_events(fipa_spans, counterparts, issues, shadow=shadow_events)
     fipa_turns, fipa_stats = fipa.join_turns(events, issues)
+    if shadow is not None and shadow_events is not None:
+        for key in sorted(set(shadow_events.entries) | set(shadow_events.exits)):
+            entries = shadow_events.entries.get(key, [])
+            exits = shadow_events.exits.get(key, [])
+            if len(entries) != 1 or len(exits) != 1:
+                shadow.counts["fipa_non_unique_or_missing_events"] += 1
+                continue
+            entry, exit_event = entries[0], exits[0]
+            paired, _ = fipa.join_turns(
+                fipa.Events(entries={key: entries}, exits={key: exits}), [],
+            )
+            if not paired:
+                shadow.counts["fipa_invalid_boundary"] += 1
+                continue
+            shadow.observe(
+                paired[0], entry["projection"], exit_event["projection"],
+                entry["body"], exit_event["body"],
+            )
     fipa_keys = len(set(events.entries) | set(events.exits))
     unregistered = [
         span
@@ -677,6 +700,11 @@ def extract_turns(spans: pd.DataFrame, config: ExtractionConfig) -> ExtractionRe
     request_candidates: Counter[str] = Counter()
     response_candidates: Counter[str] = Counter()
     for pair in pairs:
+        if shadow is not None:
+            shadow.observe(
+                _sync_turn(pair), pair.query, pair.answer,
+                pair.request_body, pair.span.response,
+            )
         reason = _pair_failure(pair)
         if not reason:
             sync_turns.append(_sync_turn(pair))

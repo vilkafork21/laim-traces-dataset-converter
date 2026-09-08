@@ -175,7 +175,7 @@ def test_ids_cannot_be_empty():
     assert result.report["invalid_span_rows"] == 1
 
 
-def test_ports_and_main_parameters_stay_unchanged():
+def test_ports_stay_unchanged_and_settings_are_explicit():
     descriptor = json.loads((Path(__file__).parents[1] / "descriptor.json").read_text())
     assert [p["name"] for p in descriptor["ports"]] == [
         "monitoring_traces",
@@ -195,7 +195,23 @@ def test_ports_and_main_parameters_stay_unchanged():
         "selection",
         "ignore_traces_checks",
         "min_extraction_coverage",
+        "llm_mode",
+        "model_id",
+        "llm_max_calls",
+        "llm_budget_seconds",
     ]
+    settings = {
+        item["parameter"]: item
+        for item in descriptor["ui"]["settings"][0]["components"][0]["config"]["components"]
+    }
+    signature = inspect.signature(main)
+    for name, ui_type in (
+        ("llm_mode", "string"), ("model_id", "string"),
+        ("llm_max_calls", "integer"), ("llm_budget_seconds", "integer"),
+    ):
+        assert settings[name]["type"] == ui_type
+        assert settings[name]["defaultValue"] == signature.parameters[name].default
+        assert signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def envelope(

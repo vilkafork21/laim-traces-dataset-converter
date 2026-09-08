@@ -17,6 +17,8 @@ import pandas as pd
 from canonical import canonicalize_turns
 from table_io import read_table
 from trace_dialogue import ExtractionConfig, extract_turns
+from llm_client import LLMSettings
+from shadow_extraction import ShadowCollector, analyze_shadow, initial_report
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +399,7 @@ def _not_ready_result(
     minimum: float,
     extraction: dict[str, Any] | None = None,
     issues: pd.DataFrame | None = None,
+    llm_assistance: dict | None = None,
 ) -> dict[str, Any]:
     started = perf_counter()
     assessment_mode = metric.get("assessment_mode") or "qa"
@@ -467,6 +470,8 @@ def _not_ready_result(
     if extraction is not None:
         report["extraction"] = extraction
         report["issues"] = _issue_summary(issues, extraction)
+    if llm_assistance is not None:
+        report["llm_assistance"] = llm_assistance
     return {
         "monitoring_umr": monitoring_umr,
         "processing_report": report,
@@ -483,6 +488,11 @@ def main(
     selection: dict | None = None,
     ignore_traces_checks: bool = False,
     min_extraction_coverage: float = 0.9,
+    *,
+    llm_mode: str = "off",
+    model_id: str = "",
+    llm_max_calls: int = 6,
+    llm_budget_seconds: int = 180,
 ) -> dict[str, Any]:
     """Извлечь протокольные turn и вернуть UMR с проверяемым отчётом."""
     if not isinstance(ignore_traces_checks, bool):
@@ -497,6 +507,7 @@ def main(
             f"получено {min_extraction_coverage!r}"
         )
     minimum = float(min_extraction_coverage)
+    llm_settings = LLMSettings(llm_mode, model_id, llm_max_calls, llm_budget_seconds)
     metric = _validate_metric(monitoring_metric)
     requested_agent, distributive, solution_version = _selection(selection)
     if metric["status"] == "not_computable":
@@ -504,6 +515,7 @@ def main(
             metric, requested_agent, distributive, solution_version,
             reason_code=metric["reason_code"], reason=metric["reason"],
             trace_check=_validate_trace_check(None, True), minimum=minimum,
+            llm_assistance=initial_report(llm_settings, reason="metric_not_computable"),
         )
     trace_check = _validate_trace_check(traces_validation_result, ignore_traces_checks)
     if trace_check["status"] == "failed":
@@ -511,6 +523,7 @@ def main(
             metric, requested_agent, distributive, solution_version,
             reason_code="dq_failed", reason=trace_check["reason"],
             trace_check=trace_check, minimum=minimum,
+            llm_assistance=initial_report(llm_settings, reason="dq_failed"),
         )
 
     started = perf_counter()
@@ -525,13 +538,19 @@ def main(
     )
 
     stage_started = perf_counter()
+    shadow = ShadowCollector() if llm_mode == "shadow" else None
     extracted = extract_turns(
         spans,
         ExtractionConfig(
             agent_id=requested_agent, max_issue_examples=_MAX_ISSUE_EXAMPLES
         ),
+        shadow=shadow,
     )
     extraction_seconds = perf_counter() - stage_started
+    llm_assistance = (
+        analyze_shadow(shadow, llm_settings) if shadow is not None
+        else initial_report(llm_settings)
+    )
     if extracted.turns.empty:
         report = extracted.report
         return _not_ready_result(
@@ -546,6 +565,7 @@ def main(
                 f"no_boundary_trace_count={report['no_boundary_trace_count']}"
             ),
             trace_check=trace_check, minimum=minimum, extraction=report, issues=extracted.issues,
+            llm_assistance=llm_assistance,
         )
     unresolved_turns = (
         extracted.report["candidate_turn_keys"] - extracted.report["complete_turns"]
@@ -614,6 +634,7 @@ def main(
         "agent_id": agent_id,
         "assessment_mode": metric["assessment_mode"],
         "ready_for_scoring": ready,
+        "llm_assistance": llm_assistance,
         "warnings": warnings,
         "traces_validation": trace_check,
         "semantics": {

@@ -102,7 +102,9 @@
         "trace_dialogue.py",
         "bodies.py",
         "fipa.py",
-        "canonical.py"
+        "canonical.py",
+        "shadow_extraction.py",
+        "llm_client.py"
       ],
       "functionName": "main",
       "functionParameters": [],
@@ -136,6 +138,34 @@
                   "uiComponent": "input",
                   "type": "float",
                   "defaultValue": 0.9
+                },
+                {
+                  "parameter": "llm_mode",
+                  "label": "LLM-анализ: off / shadow",
+                  "uiComponent": "input",
+                  "type": "string",
+                  "defaultValue": "off"
+                },
+                {
+                  "parameter": "model_id",
+                  "label": "Модель LLM (пусто — настройка контура)",
+                  "uiComponent": "input",
+                  "type": "string",
+                  "defaultValue": ""
+                },
+                {
+                  "parameter": "llm_max_calls",
+                  "label": "Максимум LLM-вызовов (1–6)",
+                  "uiComponent": "input",
+                  "type": "integer",
+                  "defaultValue": 6
+                },
+                {
+                  "parameter": "llm_budget_seconds",
+                  "label": "Общий лимит LLM-анализа, секунд (1–180)",
+                  "uiComponent": "input",
+                  "type": "integer",
+                  "defaultValue": 180
                 }
               ]
             }

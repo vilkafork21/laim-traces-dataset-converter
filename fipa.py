@@ -162,6 +162,8 @@ def collect_events(
     spans: Iterable[ParsedSpan],
     counterparts: dict[str, set[str]],
     issues: list[dict[str, str]],
+    *,
+    shadow: Events | None = None,
 ) -> Events:
     """Разложить конверты на входы/выходы контрагентов."""
     events = Events()
@@ -191,6 +193,22 @@ def collect_events(
             query = query_projection.text if query_projection.status == "text" else ""
             route, route_path = route_label(span.outgoing)
             events.registered.add((span.trace_id, span.span_id))
+            entry = {
+                **base,
+                "input_query": query,
+                "route_label": route,
+                "downstream_request_id": _identifier(outgoing.get("reply_with")),
+                "downstream_conversation_id": _identifier(outgoing.get("conversation_id"))
+                or conversation_id,
+                "query_source_path": f"{span.incoming[0]}{query_projection.path}",
+                "sender": _identifier(incoming.get("sender")),
+                "receiver": _identifier(incoming.get("receiver")),
+                "route_source_path": route_path,
+            }
+            if shadow is not None and conversation_id and request_id:
+                shadow.entries[(conversation_id, request_id)].append({
+                    **entry, "projection": query_projection, "body": incoming,
+                })
             if (
                 conversation_id
                 and request_id
@@ -198,24 +216,7 @@ def collect_events(
                 and span.trace_id
                 and span.span_id
             ):
-                events.entries[(conversation_id, request_id)].append(
-                    {
-                        **base,
-                        "input_query": query,
-                        "route_label": route,
-                        "downstream_request_id": _identifier(
-                            outgoing.get("reply_with")
-                        ),
-                        "downstream_conversation_id": _identifier(
-                            outgoing.get("conversation_id")
-                        )
-                        or conversation_id,
-                        "query_source_path": f"{span.incoming[0]}{query_projection.path}",
-                        "sender": _identifier(incoming.get("sender")),
-                        "receiver": _identifier(incoming.get("receiver")),
-                        "route_source_path": route_path,
-                    }
-                )
+                events.entries[(conversation_id, request_id)].append(entry)
             else:
                 events.malformed_entries += 1
                 issues.append(
@@ -258,6 +259,19 @@ def collect_events(
             response = (
                 response_projection.text if response_projection.status == "text" else ""
             )
+            exit_event = {
+                **base,
+                "agent_response": response,
+                "returned_downstream_request_id": _identifier(incoming.get("in_reply_to")),
+                "returned_downstream_conversation_id": _identifier(incoming.get("conversation_id")),
+                "response_source_path": f"{span.outgoing[0]}{response_projection.path}",
+                "sender": _identifier(outgoing.get("sender")),
+                "receiver": _identifier(outgoing.get("receiver")),
+            }
+            if shadow is not None and conversation_id and request_id:
+                shadow.exits[(conversation_id, request_id)].append({
+                    **exit_event, "projection": response_projection, "body": outgoing,
+                })
             if (
                 conversation_id
                 and request_id
@@ -265,21 +279,7 @@ def collect_events(
                 and span.trace_id
                 and span.span_id
             ):
-                events.exits[(conversation_id, request_id)].append(
-                    {
-                        **base,
-                        "agent_response": response,
-                        "returned_downstream_request_id": _identifier(
-                            incoming.get("in_reply_to")
-                        ),
-                        "returned_downstream_conversation_id": _identifier(
-                            incoming.get("conversation_id")
-                        ),
-                        "response_source_path": f"{span.outgoing[0]}{response_projection.path}",
-                        "sender": _identifier(outgoing.get("sender")),
-                        "receiver": _identifier(outgoing.get("receiver")),
-                    }
-                )
+                events.exits[(conversation_id, request_id)].append(exit_event)
             elif _performative(outgoing) == "failure" and not response:
                 events.failures_without_text += 1
                 issues.append(
